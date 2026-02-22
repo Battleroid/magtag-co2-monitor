@@ -8,6 +8,7 @@
 #include <freertos/task.h>
 #include <USB.h>
 #include <esp_sleep.h>
+#include <Preferences.h>
 
 // ---------------------------------------------------------------------------
 // Timing
@@ -23,10 +24,15 @@
 #define USB_DISPLAY_INTERVAL_MS     60000
 #define BATTERY_SAMPLE_INTERVAL_MS  60000
 #define BATTERY_DISPLAY_INTERVAL_MS 300000
+#define BATTERY_USB_POLL_INTERVAL_MS 10000
 #define POWER_CHECK_INTERVAL_MS      5000
 #define USB_SAMPLE_FLASH_R             80
 #define USB_SAMPLE_FLASH_G              0
 #define USB_SAMPLE_FLASH_B            120
+#define LOW_BATTERY_PERCENT            10
+#define LOW_BATTERY_FLASH_INTERVAL_MS 900000UL
+#define SCD30_I2C_ADDR                0x61
+#define SCD30_CMD_STOP_MEASUREMENTS   0x0104
 
 #define BATTERY_DISPLAY_EVERY_N ((BATTERY_DISPLAY_INTERVAL_MS / BATTERY_SAMPLE_INTERVAL_MS) > 0 ? (BATTERY_DISPLAY_INTERVAL_MS / BATTERY_SAMPLE_INTERVAL_MS) : 1)
 
@@ -94,7 +100,15 @@ static unsigned long lastPowerCheckMs = 0;
 static int usbHeuristicScore = 0;
 static bool usbByHeuristic = false;
 RTC_DATA_ATTR static uint32_t batterySampleCycles = 0;
+RTC_DATA_ATTR static uint32_t lowBatteryElapsedMs = 0;
+RTC_DATA_ATTR static uint32_t batterySampleElapsedMs = BATTERY_SAMPLE_INTERVAL_MS;
 static bool wokeFromDeepSleep = false;
+static Preferences prefs;
+static bool prefsReady = false;
+
+#define PREFS_NAMESPACE "magco2"
+#define PREF_KEY_INVERT "invert"
+#define PREF_KEY_LAYOUT "layout"
 
 static uint16_t fgColor() { return inverted ? EPD_WHITE : EPD_BLACK; }
 static uint16_t bgColor() { return inverted ? EPD_BLACK : EPD_WHITE; }
@@ -102,6 +116,39 @@ static uint16_t bgColor() { return inverted ? EPD_BLACK : EPD_WHITE; }
 static float readBatteryVoltage() {
     int raw = analogRead(BATT_MONITOR);
     return (raw / 4095.0f) * 3.3f * 2.0f;
+}
+
+static uint8_t batteryPercentFromVoltage(float voltage) {
+    const float fullV = 4.20f;
+    const float emptyV = 3.30f;
+    float pct = (voltage - emptyV) * 100.0f / (fullV - emptyV);
+    if (pct < 0.0f) pct = 0.0f;
+    if (pct > 100.0f) pct = 100.0f;
+    return (uint8_t)pct;
+}
+
+static bool stopScd30Measurements() {
+    Wire.beginTransmission(SCD30_I2C_ADDR);
+    Wire.write((uint8_t)((SCD30_CMD_STOP_MEASUREMENTS >> 8) & 0xFF));
+    Wire.write((uint8_t)(SCD30_CMD_STOP_MEASUREMENTS & 0xFF));
+    uint8_t err = Wire.endTransmission(true);
+    delay(4);
+    return (err == 0);
+}
+
+static void loadVisualPreferences() {
+    if (!prefsReady) return;
+    inverted = prefs.getBool(PREF_KEY_INVERT, false);
+    graphHeavyLayout = prefs.getBool(PREF_KEY_LAYOUT, false);
+    Serial.printf("Loaded prefs: invert=%s layout=%s\n",
+                  inverted ? "ON" : "OFF",
+                  graphHeavyLayout ? "GRAPH_HEAVY" : "BALANCED");
+}
+
+static void saveVisualPreferences() {
+    if (!prefsReady) return;
+    prefs.putBool(PREF_KEY_INVERT, inverted);
+    prefs.putBool(PREF_KEY_LAYOUT, graphHeavyLayout);
 }
 
 static void adjustUsbHeuristicScore(float dv) {
@@ -225,6 +272,13 @@ static void flashSampleIndicator() {
 }
 
 static void enterDeepSleepMs(uint32_t sleepMs) {
+    bool stopOk = stopScd30Measurements();
+    if (!stopOk) {
+        Serial.println("Warning: failed to send SCD30 stop command");
+    } else {
+        Serial.println("SCD30 measurement stopped before deep sleep");
+    }
+
     digitalWrite(NEOPIXEL_POWER, HIGH);
     digitalWrite(SPEAKER_SHUTDOWN, LOW);
 
@@ -252,6 +306,7 @@ static void handleInvertToggleRequest() {
     portEXIT_CRITICAL(&stateMux);
 
     inverted = !inverted;
+    saveVisualPreferences();
     Serial.printf("Display inverted: %s\n", inverted ? "ON" : "OFF");
     flashNeopixelsColor(24, 24, 24, INVERT_FLASH_MS);
     playInvertToggleTone();
@@ -278,6 +333,7 @@ static void applyPendingInvertToggleIfAny() {
     if (!shouldApply) return;
 
     inverted = !inverted;
+    saveVisualPreferences();
     Serial.printf("Display inverted (deferred): %s\n", inverted ? "ON" : "OFF");
     flashNeopixelsColor(24, 24, 24, INVERT_FLASH_MS);
     playInvertToggleTone();
@@ -304,6 +360,7 @@ static void handleLayoutToggleRequest() {
     portEXIT_CRITICAL(&stateMux);
 
     graphHeavyLayout = !graphHeavyLayout;
+    saveVisualPreferences();
     Serial.printf("Layout mode: %s\n", graphHeavyLayout ? "GRAPH_HEAVY" : "BALANCED");
     flashNeopixelsColor(100, 0, 180, INVERT_FLASH_MS);
     playLayoutToggleTone();
@@ -330,6 +387,7 @@ static void applyPendingLayoutToggleIfAny() {
     if (!shouldApply) return;
 
     graphHeavyLayout = !graphHeavyLayout;
+    saveVisualPreferences();
     Serial.printf("Layout mode (deferred): %s\n", graphHeavyLayout ? "GRAPH_HEAVY" : "BALANCED");
     flashNeopixelsColor(100, 0, 180, INVERT_FLASH_MS);
     playLayoutToggleTone();
@@ -585,6 +643,12 @@ void setup() {
     Serial.println("MagTag CO2 Monitor starting...");
     wokeFromDeepSleep = (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED);
 
+    prefsReady = prefs.begin(PREFS_NAMESPACE, false);
+    if (!prefsReady) {
+        Serial.println("WARNING: failed to open preferences namespace");
+    }
+    loadVisualPreferences();
+
     // ── Neopixels ──
     pinMode(NEOPIXEL_POWER, OUTPUT);
     digitalWrite(NEOPIXEL_POWER, HIGH);
@@ -676,6 +740,34 @@ void loop() {
     }
 
     if (!usbPowerPresent) {
+        const uint32_t sleepPollMs = BATTERY_USB_POLL_INTERVAL_MS;
+
+        float battV = readBatteryVoltage();
+        uint8_t battPct = batteryPercentFromVoltage(battV);
+
+        if (battPct < LOW_BATTERY_PERCENT) {
+            lowBatteryElapsedMs += sleepPollMs;
+            if (lowBatteryElapsedMs >= LOW_BATTERY_FLASH_INTERVAL_MS) {
+                Serial.printf("Low battery warning: %.2fV (%u%%)\n", battV, battPct);
+                flashNeopixelsRed();
+                lowBatteryElapsedMs = 0;
+            }
+        } else {
+            lowBatteryElapsedMs = 0;
+        }
+
+        if (batterySampleElapsedMs < BATTERY_SAMPLE_INTERVAL_MS) {
+            batterySampleElapsedMs += sleepPollMs;
+            if (batterySampleElapsedMs > BATTERY_SAMPLE_INTERVAL_MS) {
+                batterySampleElapsedMs = BATTERY_SAMPLE_INTERVAL_MS;
+            }
+
+            enterDeepSleepMs(sleepPollMs);
+            return;
+        }
+
+        batterySampleElapsedMs = 0;
+
         bool sampled = false;
 
         unsigned long waitStart = millis();
@@ -734,7 +826,7 @@ void loop() {
             applyPendingLayoutToggleIfAny();
         }
 
-        enterDeepSleepMs(BATTERY_SAMPLE_INTERVAL_MS);
+        enterDeepSleepMs(sleepPollMs);
         return;
     }
 
