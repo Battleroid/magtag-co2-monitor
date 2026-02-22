@@ -64,8 +64,10 @@ static unsigned long histGetTs(int i) {
 // Display colour-scheme toggle  (D15 long-press)
 // ---------------------------------------------------------------------------
 #define INVERT_BTN   15           // D15 button
+#define LAYOUT_BTN   11           // D11 button
 #define LONG_PRESS_MS 2000
 static bool     inverted       = false;
+static bool     graphHeavyLayout = false;
 
 // Last displayed values (for immediate redraw on invert toggle)
 static float lastCO2   = 0;
@@ -74,6 +76,7 @@ static float lastRH    = 0;
 static bool  hasReading = false;
 static bool  displayUpdateInProgress = false;
 static bool  invertTogglePending = false;
+static bool  layoutTogglePending = false;
 static portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
 
 static bool usbPowerPresent = false;
@@ -150,6 +153,10 @@ static void playStartupJingle() {
 
 static void playInvertToggleTone() {
     playToneOnce(1318, 80);
+}
+
+static void playLayoutToggleTone() {
+    playToneOnce(988, 90);
 }
 
 static void playUsbConnectedJingle() {
@@ -257,6 +264,59 @@ static void applyPendingInvertToggleIfAny() {
     portEXIT_CRITICAL(&stateMux);
 }
 
+static void handleLayoutToggleRequest() {
+    bool canApplyNow;
+
+    portENTER_CRITICAL(&stateMux);
+    canApplyNow = !displayUpdateInProgress;
+    if (!canApplyNow) {
+        layoutTogglePending = true;
+        portEXIT_CRITICAL(&stateMux);
+        return;
+    }
+    displayUpdateInProgress = true;
+    portEXIT_CRITICAL(&stateMux);
+
+    graphHeavyLayout = !graphHeavyLayout;
+    Serial.printf("Layout mode: %s\n", graphHeavyLayout ? "GRAPH_HEAVY" : "BALANCED");
+    flashNeopixelsColor(100, 0, 180, INVERT_FLASH_MS);
+    playLayoutToggleTone();
+
+    if (hasReading) {
+        updateDisplay(lastCO2, lastTempF, lastRH);
+    }
+
+    portENTER_CRITICAL(&stateMux);
+    displayUpdateInProgress = false;
+    portEXIT_CRITICAL(&stateMux);
+}
+
+static void applyPendingLayoutToggleIfAny() {
+    bool shouldApply = false;
+    portENTER_CRITICAL(&stateMux);
+    if (layoutTogglePending && !displayUpdateInProgress) {
+        layoutTogglePending = false;
+        displayUpdateInProgress = true;
+        shouldApply = true;
+    }
+    portEXIT_CRITICAL(&stateMux);
+
+    if (!shouldApply) return;
+
+    graphHeavyLayout = !graphHeavyLayout;
+    Serial.printf("Layout mode (deferred): %s\n", graphHeavyLayout ? "GRAPH_HEAVY" : "BALANCED");
+    flashNeopixelsColor(100, 0, 180, INVERT_FLASH_MS);
+    playLayoutToggleTone();
+
+    if (hasReading) {
+        updateDisplay(lastCO2, lastTempF, lastRH);
+    }
+
+    portENTER_CRITICAL(&stateMux);
+    displayUpdateInProgress = false;
+    portEXIT_CRITICAL(&stateMux);
+}
+
 static void invertButtonTask(void *param) {
     (void)param;
     bool pressedPrev = false;
@@ -274,6 +334,34 @@ static void invertButtonTask(void *param) {
         if (pressed && !longPressFired && (millis() - downAt >= LONG_PRESS_MS)) {
             longPressFired = true;
             handleInvertToggleRequest();
+        }
+
+        if (!pressed) {
+            longPressFired = false;
+        }
+
+        pressedPrev = pressed;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+static void layoutButtonTask(void *param) {
+    (void)param;
+    bool pressedPrev = false;
+    bool longPressFired = false;
+    unsigned long downAt = 0;
+
+    while (true) {
+        bool pressed = (digitalRead(LAYOUT_BTN) == LOW);
+
+        if (pressed && !pressedPrev) {
+            downAt = millis();
+            longPressFired = false;
+        }
+
+        if (pressed && !longPressFired && (millis() - downAt >= LONG_PRESS_MS)) {
+            longPressFired = true;
+            handleLayoutToggleRequest();
         }
 
         if (!pressed) {
@@ -389,9 +477,13 @@ static void drawGraph(const float *buf, int n,
 //   Right side: three line graphs (CO2 / Temp / RH) over last 30 min.
 // ---------------------------------------------------------------------------
 // Layout constants  (screen is 296 x 128)
-#define TEXT_RIGHT   140          // right edge for value text
-#define GRAPH_X      152          // left edge of graphs
-#define GRAPH_W      136          // graph width  (296 - 152 - 8 padding)
+#define TEXT_RIGHT_BALANCED   140
+#define GRAPH_X_BALANCED      152
+#define GRAPH_W_BALANCED      136
+
+#define TEXT_RIGHT_GRAPH_HEAVY 88
+#define GRAPH_X_GRAPH_HEAVY    100
+#define GRAPH_W_GRAPH_HEAVY    188
 
 // CO2 graph is taller to match the larger text
 #define GRAPH_H_CO2  40
@@ -402,6 +494,9 @@ static void drawGraph(const float *buf, int n,
 
 void updateDisplay(float co2, float tempF, float rh) {
     uint16_t fg = fgColor();
+    int16_t textRight = graphHeavyLayout ? TEXT_RIGHT_GRAPH_HEAVY : TEXT_RIGHT_BALANCED;
+    int16_t graphX = graphHeavyLayout ? GRAPH_X_GRAPH_HEAVY : GRAPH_X_BALANCED;
+    int16_t graphW = graphHeavyLayout ? GRAPH_W_GRAPH_HEAVY : GRAPH_W_BALANCED;
 
     display.clearBuffer();
     if (inverted) display.fillScreen(EPD_BLACK);
@@ -417,22 +512,22 @@ void updateDisplay(float co2, float tempF, float rh) {
     // ── CO2 ── text centred on CO2 graph row (textSize 3 = 24px high)
     display.setTextSize(3);
     snprintf(buf, sizeof(buf), "%d", (int)co2);
-    printRightAligned(TEXT_RIGHT, gyCO2 + GRAPH_H_CO2 / 2 - 12, buf);
+    printRightAligned(textRight, gyCO2 + GRAPH_H_CO2 / 2 - 12, buf);
 
     // ── Temperature ── text centred on temp graph row (textSize 2 = 16px high)
     display.setTextSize(2);
     snprintf(buf, sizeof(buf), "%.1f F", tempF);
-    printRightAligned(TEXT_RIGHT, gyTemp + GRAPH_H_STD / 2 - 8, buf);
+    printRightAligned(textRight, gyTemp + GRAPH_H_STD / 2 - 8, buf);
 
     // ── Humidity ── text centred on RH graph row
     snprintf(buf, sizeof(buf), "%.1f %%", rh);
-    printRightAligned(TEXT_RIGHT, gyRH + GRAPH_H_STD / 2 - 8, buf);
+    printRightAligned(textRight, gyRH + GRAPH_H_STD / 2 - 8, buf);
 
     // ── Graphs ──
     int n = histSamples();
-    drawGraph(histCO2,   n, GRAPH_X, gyCO2,  GRAPH_W, GRAPH_H_CO2);
-    drawGraph(histTempF, n, GRAPH_X, gyTemp,  GRAPH_W, GRAPH_H_STD);
-    drawGraph(histRH,    n, GRAPH_X, gyRH,    GRAPH_W, GRAPH_H_STD);
+    drawGraph(histCO2,   n, graphX, gyCO2,  graphW, GRAPH_H_CO2);
+    drawGraph(histTempF, n, graphX, gyTemp,  graphW, GRAPH_H_STD);
+    drawGraph(histRH,    n, graphX, gyRH,    graphW, GRAPH_H_STD);
 
     display.display();
 }
@@ -483,6 +578,8 @@ void setup() {
 
     // ── Invert button (D15) ──
     pinMode(INVERT_BTN, INPUT_PULLUP);
+    // ── Layout button (D11) ──
+    pinMode(LAYOUT_BTN, INPUT_PULLUP);
 
     // ── LIS3DH accelerometer (on-board) ──
     if (!lis.begin(0x19)) {
@@ -506,6 +603,8 @@ void setup() {
 
     // ── D15 long-press listener task (runs continuously) ──
     xTaskCreate(invertButtonTask, "invert_btn", 4096, nullptr, 1, nullptr);
+    // ── D11 long-press listener task (runs continuously) ──
+    xTaskCreate(layoutButtonTask, "layout_btn", 4096, nullptr, 1, nullptr);
 
     delay(5000);
 
@@ -591,11 +690,15 @@ void loop() {
                 portEXIT_CRITICAL(&stateMux);
 
                 applyPendingInvertToggleIfAny();
+                applyPendingLayoutToggleIfAny();
             }
         } else {
             Serial.println("Failed to read SCD-30");
         }
     }
+
+    applyPendingInvertToggleIfAny();
+    applyPendingLayoutToggleIfAny();
 
     // Keep loop responsive for power-mode transitions and deferred toggles
     delay(100);
