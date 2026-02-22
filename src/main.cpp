@@ -44,6 +44,9 @@
 // Display layout and rendering (where things are drawn)
 // ---------------------------------------------------------------------------
 #define GRAPH_LINE_THICKNESS              1    // Line thickness used for history traces.
+#define GRAPH_UNDERLINE_LIGHT_FILL        1    // Fill area under graph line with light gray when enabled.
+#define GRAPH_UNDERLINE_FILL_SHADE EPD_DARK    // Under-line fill shade: EPD_LIGHT, EPD_DARK, EPD_GRAY, or EPD_WHITE.
+#define GRAPH_UNDERLINE_FILL_RISING_ONLY  1    // When enabled, only rising segments get under-line fill.
 
 // Combined view layout presets on 296x128 panel.
 #define TEXT_RIGHT_BALANCED             140    // Right edge of value text in balanced layout.
@@ -1113,6 +1116,7 @@ static void drawGraph(const float *buf, int n,
     if (hi - lo < 0.1f) { lo -= 0.5f; hi += 0.5f; }
 
     uint16_t fg = fgColor();
+    const int16_t graphBottom = gy + gh - 1;
 
     // Plot line segments, newest sample pinned to the right edge
     // and the graph shifts left as new samples arrive.
@@ -1121,6 +1125,36 @@ static void drawGraph(const float *buf, int n,
         return gy + gh - 1 - (int16_t)(frac * (gh - 1)); // top = high
     };
 
+#if GRAPH_UNDERLINE_LIGHT_FILL
+    auto fillUnderSegment = [&](int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
+        const uint16_t shade = GRAPH_UNDERLINE_FILL_SHADE;
+        const int16_t graphRight = gx + gw - 1;
+
+        if (x0 == x1) {
+            if (x0 < gx || x0 > graphRight) return;
+            if (y0 < gy) y0 = gy;
+            if (y0 > graphBottom) y0 = graphBottom;
+            display.drawLine(x0, y0, x0, graphBottom, shade);
+            return;
+        }
+
+        int16_t xStart = (x0 < x1) ? x0 : x1;
+        int16_t xEnd = (x0 < x1) ? x1 : x0;
+        if (xEnd < gx || xStart > graphRight) return;
+        if (xStart < gx) xStart = gx;
+        if (xEnd > graphRight) xEnd = graphRight;
+
+        float dx = (float)(x1 - x0);
+        for (int16_t x = xStart; x <= xEnd; ++x) {
+            float t = (dx == 0.0f) ? 0.0f : ((float)(x - x0) / dx);
+            int16_t y = (int16_t)(y0 + (y1 - y0) * t);
+            if (y < gy) y = gy;
+            if (y > graphBottom) y = graphBottom;
+            display.drawLine(x, y, x, graphBottom, shade);
+        }
+    };
+#endif
+
     // x positions are based on sample age over fixed 15-minute window,
     // so the graph remains truly time-based across variable sample intervals.
     for (int i = 1; i < win; i++) {
@@ -1128,8 +1162,19 @@ static void drawGraph(const float *buf, int n,
         unsigned long age1 = nowMs - histGetTs(start + i);
         int16_t x0 = gx + gw - 1 - (int32_t)age0 * (gw - 1) / (int32_t)windowMs;
         int16_t x1 = gx + gw - 1 - (int32_t)age1 * (gw - 1) / (int32_t)windowMs;
-        int16_t y0 = yForVal(histGet(buf, start + i - 1));
-        int16_t y1 = yForVal(histGet(buf, start + i));
+        float v0 = histGet(buf, start + i - 1);
+        float v1 = histGet(buf, start + i);
+        int16_t y0 = yForVal(v0);
+        int16_t y1 = yForVal(v1);
+#if GRAPH_UNDERLINE_LIGHT_FILL
+    #if GRAPH_UNDERLINE_FILL_RISING_ONLY
+        if (v1 > v0) {
+            fillUnderSegment(x0, y0, x1, y1);
+        }
+    #else
+        fillUnderSegment(x0, y0, x1, y1);
+    #endif
+#endif
         if (GRAPH_LINE_THICKNESS <= 1) {
             display.drawLine(x0, y0, x1, y1, fg);
         } else {
