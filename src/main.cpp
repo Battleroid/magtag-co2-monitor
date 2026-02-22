@@ -962,9 +962,15 @@ void updateDisplay(float co2, float tempF, float rh) {
         int16_t graphW = contentRight - graphX + 1;
         if (graphW < 24) graphW = 24;
         if (textRight >= graphX) textRight = graphX - 4;
-        int16_t yCurrent = contentTop + 6;
-        int16_t yHigh = contentTop + (contentH / 2) - 8;
-        int16_t yLow = contentBottom - 20;
+
+        int16_t totalGraphH = GRAPH_H_CO2 + GRAPH_H_STD + GRAPH_H_STD + GRAPH_GAP + GRAPH_GAP;
+        int16_t gyCO2  = contentTop + ((contentH > totalGraphH) ? (contentH - totalGraphH) / 2 : 0);
+        int16_t gyTemp = gyCO2 + GRAPH_H_CO2 + GRAPH_GAP;
+        int16_t gyRH   = gyTemp + GRAPH_H_STD + GRAPH_GAP;
+
+        int16_t yCurrent = gyCO2 + GRAPH_H_CO2 / 2 - 12;
+        int16_t yHigh = gyTemp + GRAPH_H_STD / 2 - 8;
+        int16_t yLow = gyRH + GRAPH_H_STD / 2 - 8;
 
         if (decimals == 0) snprintf(buf, sizeof(buf), "%d", (int)currentVal);
         else snprintf(buf, sizeof(buf), "%.1f", currentVal);
