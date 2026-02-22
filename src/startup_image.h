@@ -1,8 +1,8 @@
 #pragma once
 #include <Arduino.h>
 
-#define STARTUP_IMAGE_WIDTH 296
-#define STARTUP_IMAGE_HEIGHT 128
+#define STARTUPIMAGE_WIDTH 296
+#define STARTUPIMAGE_HEIGHT 128
 
 static const uint8_t PROGMEM startupImageBitmap[] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -303,4 +303,8 @@ static const uint8_t PROGMEM startupImageBitmap[] = {
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
-#define STARTUP_IMAGE_BITMAP startupImageBitmap
+#define STARTUPIMAGE_BITMAP startupImageBitmap
+
+#define STARTUP_IMAGE_WIDTH STARTUPIMAGE_WIDTH
+#define STARTUP_IMAGE_HEIGHT STARTUPIMAGE_HEIGHT
+#define STARTUP_IMAGE_BITMAP STARTUPIMAGE_BITMAP

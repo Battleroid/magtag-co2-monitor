@@ -23,32 +23,153 @@
 #endif
 
 // ---------------------------------------------------------------------------
-// Timing
+// Timing and scheduling (what runs when)
 // ---------------------------------------------------------------------------
-#define CYCLE_INTERVAL_MS  20000   // 20 seconds between readings
-#define FLASH_DURATION_MS    500   // neopixel flash length
-#define STARTUP_FLASH_MS     220
-#define INVERT_FLASH_MS      150
-#define GRAPH_WINDOW_MINUTES 15
-#define GRAPH_WINDOW_SAMPLES ((GRAPH_WINDOW_MINUTES * 60 * 1000) / CYCLE_INTERVAL_MS)
+#define CYCLE_INTERVAL_MS               20000   // Main loop cadence: 20 s between measurement cycles.
+#define USB_SAMPLE_INTERVAL_MS          15000   // Faster sampling while externally powered.
+#define USB_DISPLAY_INTERVAL_MS         30000   // More frequent display updates while on USB.
+#define BATTERY_SAMPLE_INTERVAL_MS      60000   // Slower sampling to conserve battery.
+#define BATTERY_DISPLAY_INTERVAL_MS    300000   // E-ink refresh interval on battery.
+#define BATTERY_USB_POLL_INTERVAL_MS    10000   // USB-power poll period in battery mode.
+#define POWER_CHECK_INTERVAL_MS          5000   // Battery/USB heuristic update period.
 
-#define USB_SAMPLE_INTERVAL_MS      15000
-#define USB_DISPLAY_INTERVAL_MS     30000
-#define BATTERY_SAMPLE_INTERVAL_MS  60000
-#define BATTERY_DISPLAY_INTERVAL_MS 300000
-#define BATTERY_USB_POLL_INTERVAL_MS 10000
-#define POWER_CHECK_INTERVAL_MS      5000
-#define USB_SAMPLE_FLASH_R             80
-#define USB_SAMPLE_FLASH_G              0
-#define USB_SAMPLE_FLASH_B            120
-#define LOW_BATTERY_PERCENT            10
-#define LOW_BATTERY_FLASH_INTERVAL_MS 900000UL
-#define SCD30_I2C_ADDR                0x61
-#define SCD30_CMD_STOP_MEASUREMENTS   0x0104
-#define SCD30_WARMUP_MS               25000  // cold-start warm-up for accurate readings
-#define GRAPH_LINE_THICKNESS           1
+#define FLASH_DURATION_MS                 500   // Standard NeoPixel flash duration.
+#define STARTUP_FLASH_MS                  220   // Startup flash duration.
+#define INVERT_FLASH_MS                   150   // UI toggle feedback flash duration.
+
+#define GRAPH_WINDOW_MINUTES               15   // Time span shown on graphs.
+#define GRAPH_WINDOW_SAMPLES ((GRAPH_WINDOW_MINUTES * 60 * 1000) / CYCLE_INTERVAL_MS) // Window size at nominal cadence.
+
+// ---------------------------------------------------------------------------
+// Display layout and rendering (where things are drawn)
+// ---------------------------------------------------------------------------
+#define GRAPH_LINE_THICKNESS              1    // Line thickness used for history traces.
+
+// Combined view layout presets on 296x128 panel.
+#define TEXT_RIGHT_BALANCED             140    // Right edge of value text in balanced layout.
+#define GRAPH_X_BALANCED                152    // Graphs start X in balanced layout.
+#define GRAPH_W_BALANCED                136    // Graph width in balanced layout.
+
+#define TEXT_RIGHT_GRAPH_HEAVY          108    // Right edge of value text in graph-heavy layout.
+#define GRAPH_X_GRAPH_HEAVY             120    // Graphs start X in graph-heavy layout.
+#define GRAPH_W_GRAPH_HEAVY             168    // Graph width in graph-heavy layout.
+
+#define GRAPH_H_CO2                      40    // CO2 graph height (emphasized metric).
+#define GRAPH_H_STD                      30    // Temp/RH graph height.
+#define GRAPH_GAP                         6    // Vertical spacing between stacked graphs.
+#define GRAPH_Y0                          8    // Legacy top offset reference for stacked graphs.
+
+// Screen-edge content padding for enclosure/bezel compensation.
+#define SCREEN_PAD_LEFT                   0
+#define SCREEN_PAD_RIGHT                 10
+#define SCREEN_PAD_TOP                    0
+#define SCREEN_PAD_BOTTOM                 0
+
+// ---------------------------------------------------------------------------
+// UI input mapping (which button controls what)
+// ---------------------------------------------------------------------------
+#define INVERT_BTN                       15    // D15: toggle black/white inversion.
+#define MODE_BTN                         12    // D12: cycle display mode.
+#define CAROUSEL_BTN                     14    // D14: toggle carousel mode.
+#define LONG_PRESS_MS                  2000    // Long-press threshold for button actions.
+
+// ---------------------------------------------------------------------------
+// NeoPixel feedback colors (what each event looks like)
+// ---------------------------------------------------------------------------
+#define USB_SAMPLE_FLASH_R               15
+#define USB_SAMPLE_FLASH_G               15
+#define USB_SAMPLE_FLASH_B               15
+
+#define STARTUP_FLASH_R                   0
+#define STARTUP_FLASH_G                 180
+#define STARTUP_FLASH_B                   0
+
+#define USB_CONNECTED_FLASH_R             0
+#define USB_CONNECTED_FLASH_G             0
+#define USB_CONNECTED_FLASH_B           200
+
+#define USB_DISCONNECTED_FLASH_R        220
+#define USB_DISCONNECTED_FLASH_G         90
+#define USB_DISCONNECTED_FLASH_B          0
+
+#define INVERT_TOGGLE_FLASH_R            24
+#define INVERT_TOGGLE_FLASH_G            24
+#define INVERT_TOGGLE_FLASH_B            24
+
+#define MODE_TOGGLE_FLASH_R              24
+#define MODE_TOGGLE_FLASH_G              24
+#define MODE_TOGGLE_FLASH_B              24
+
+#define CAROUSEL_ON_FLASH_R             140
+#define CAROUSEL_ON_FLASH_G               0
+#define CAROUSEL_ON_FLASH_B             110
+
+#define CAROUSEL_OFF_FLASH_R            255
+#define CAROUSEL_OFF_FLASH_G              0
+#define CAROUSEL_OFF_FLASH_B              0
+
+#define GENERIC_RED_FLASH_R             255
+#define GENERIC_RED_FLASH_G               0
+#define GENERIC_RED_FLASH_B               0
+
+// ---------------------------------------------------------------------------
+// Battery behavior thresholds and alert timings
+// ---------------------------------------------------------------------------
+#define LOW_BATTERY_PERCENT              10    // Threshold for low-battery warning behavior.
+#define LOW_BATTERY_FLASH_INTERVAL_MS 900000UL // Repeat interval for low-battery reminder flash.
+
+#define BATTERY_WARN_50_PERCENT          50    // Mid-level warning threshold.
+#define BATTERY_WARN_50_DURATION_MS   30000UL // Mid-level warning message duration.
+
+#define BATTERY_CRITICAL_PERCENT         10    // Critical battery threshold.
+#define BATTERY_CRITICAL_INTERVAL_MS 1800000UL // Repeat interval for critical warning.
+#define BATTERY_CRITICAL_DURATION_MS  60000UL // Critical warning message duration.
+#define BATTERY_CRITICAL_BLINK_MS       600UL // Blink cadence during critical warning.
+
+#define BATTERY_CRITICAL_LED_R           30
+#define BATTERY_CRITICAL_LED_G            0
+#define BATTERY_CRITICAL_LED_B            0
+
+// Battery-level LED thresholds (%). Mapping:
+// >80 => 4 green, 50..80 => 3 yellow, 30..49 => 2 orange, <30 => 1 red
+#define BATTERY_LEVEL_4_MIN_PERCENT      81
+#define BATTERY_LEVEL_3_MIN_PERCENT      50
+#define BATTERY_LEVEL_2_MIN_PERCENT      30
+
+// Battery-level LED colors.
+#define BATTERY_LEVEL_4_LED_R             0
+#define BATTERY_LEVEL_4_LED_G           180
+#define BATTERY_LEVEL_4_LED_B             0
+#define BATTERY_LEVEL_3_LED_R           220
+#define BATTERY_LEVEL_3_LED_G           180
+#define BATTERY_LEVEL_3_LED_B             0
+#define BATTERY_LEVEL_2_LED_R           255
+#define BATTERY_LEVEL_2_LED_G            90
+#define BATTERY_LEVEL_2_LED_B             0
+#define BATTERY_LEVEL_1_LED_R           255
+#define BATTERY_LEVEL_1_LED_G             0
+#define BATTERY_LEVEL_1_LED_B             0
+
+// Battery-level LED animation timing.
+#define BATTERY_LEVEL_FLASH_ON_MS       180
+#define BATTERY_LEVEL_FLASH_OFF_MS      120
+#define BATTERY_STARTUP_SWEEP_MS         90
+#define BATTERY_STARTUP_LEVEL_FLASHES     3
 
 #define BATTERY_DISPLAY_EVERY_N ((BATTERY_DISPLAY_INTERVAL_MS / BATTERY_SAMPLE_INTERVAL_MS) > 0 ? (BATTERY_DISPLAY_INTERVAL_MS / BATTERY_SAMPLE_INTERVAL_MS) : 1)
+
+// ---------------------------------------------------------------------------
+// Sensor protocol constants
+// ---------------------------------------------------------------------------
+#define SCD30_I2C_ADDR                 0x61   // SCD30 I2C slave address.
+#define SCD30_CMD_STOP_MEASUREMENTS    0x0104 // SCD30 command: stop continuous measurement.
+#define SCD30_WARMUP_MS               25000   // Cold-start warm-up before trusting readings.
+
+// ---------------------------------------------------------------------------
+// Preferences storage keys
+// ---------------------------------------------------------------------------
+#define PREFS_NAMESPACE "magco2"        // NVS namespace for persisted UI settings.
+#define PREF_KEY_INVERT "invert"        // Persisted inversion toggle.
 
 // ---------------------------------------------------------------------------
 // History ring buffer  (30 min @ 20 s/sample = 90 samples)
@@ -89,10 +210,6 @@ static unsigned long histGetTs(int i) {
 // ---------------------------------------------------------------------------
 // Display colour-scheme toggle  (D15 long-press)
 // ---------------------------------------------------------------------------
-#define INVERT_BTN   15           // D15 button
-#define MODE_BTN     12           // D12 button
-#define CAROUSEL_BTN 14           // D14 button
-#define LONG_PRESS_MS 2000
 static bool     inverted       = false;
 static bool     graphHeavyLayout = true;
 
@@ -131,8 +248,16 @@ static bool usbByHeuristic = false;
 // USB event-driven mount tracking (set from TinyUSB task context)
 static volatile bool usbMounted = false;
 RTC_DATA_ATTR static uint32_t batterySampleCycles = 0;
-RTC_DATA_ATTR static uint32_t lowBatteryElapsedMs = 0;
 RTC_DATA_ATTR static uint32_t batterySampleElapsedMs = BATTERY_SAMPLE_INTERVAL_MS;
+RTC_DATA_ATTR static bool batteryWarn50Shown = false;
+RTC_DATA_ATTR static uint32_t batteryCriticalElapsedMs = 0;
+RTC_DATA_ATTR static bool rtcHasUsbPowerState = false;
+RTC_DATA_ATTR static bool rtcLastUsbPowerPresent = false;
+RTC_DATA_ATTR static uint8_t rtcLastBatteryLedTier = 255;
+RTC_DATA_ATTR static bool rtcBatteryTierFlashPending = false;
+RTC_DATA_ATTR static uint8_t rtcPendingBatteryLedTier = 0;
+RTC_DATA_ATTR static bool rtcNotified4to3 = false;
+RTC_DATA_ATTR static bool rtcNotified2to1 = false;
 
 // RTC-persisted state (survives deep sleep)
 RTC_DATA_ATTR static uint8_t  rtcDisplayMode       = DISPLAY_MODE_COMBINED;
@@ -148,9 +273,6 @@ static uint8_t buttonWakeGPIO = 0;   // which button GPIO caused wake (0 = none)
 static bool scd30Ready = false;      // whether SCD30 was initialized this wake cycle
 static Preferences prefs;
 static bool prefsReady = false;
-
-#define PREFS_NAMESPACE "magco2"
-#define PREF_KEY_INVERT "invert"
 
 static uint16_t fgColor() { return inverted ? EPD_WHITE : EPD_BLACK; }
 static uint16_t bgColor() { return inverted ? EPD_BLACK : EPD_WHITE; }
@@ -308,6 +430,128 @@ static bool detectUsbPowerPresent() {
     return mounted || usbByHeuristic;
 }
 
+extern Adafruit_NeoPixel pixels;
+
+static uint8_t batteryLedTierFromPercent(uint8_t batteryPercent) {
+    if (batteryPercent >= BATTERY_LEVEL_4_MIN_PERCENT) return 4;
+    if (batteryPercent >= BATTERY_LEVEL_3_MIN_PERCENT) return 3;
+    if (batteryPercent >= BATTERY_LEVEL_2_MIN_PERCENT) return 2;
+    return 1;
+}
+
+static void batteryLedTierColor(uint8_t tier, uint8_t *red, uint8_t *green, uint8_t *blue) {
+    switch (tier) {
+        case 4:
+            *red = BATTERY_LEVEL_4_LED_R; *green = BATTERY_LEVEL_4_LED_G; *blue = BATTERY_LEVEL_4_LED_B;
+            break;
+        case 3:
+            *red = BATTERY_LEVEL_3_LED_R; *green = BATTERY_LEVEL_3_LED_G; *blue = BATTERY_LEVEL_3_LED_B;
+            break;
+        case 2:
+            *red = BATTERY_LEVEL_2_LED_R; *green = BATTERY_LEVEL_2_LED_G; *blue = BATTERY_LEVEL_2_LED_B;
+            break;
+        default:
+            *red = BATTERY_LEVEL_1_LED_R; *green = BATTERY_LEVEL_1_LED_G; *blue = BATTERY_LEVEL_1_LED_B;
+            break;
+    }
+}
+
+static void showBatteryLedFrame(uint8_t litCount, uint8_t red, uint8_t green, uint8_t blue) {
+    const uint8_t batteryPixelOrder[4] = {3, 2, 1, 0};
+    if (litCount > 4) litCount = 4;
+
+    pixels.clear();
+    for (uint8_t i = 0; i < litCount; i++) {
+        pixels.setPixelColor(batteryPixelOrder[i], pixels.Color(red, green, blue));
+    }
+    pixels.show();
+}
+
+static void flashBatteryLedTier(uint8_t tier, uint8_t flashes, uint16_t onMs, uint16_t offMs) {
+    uint8_t red, green, blue;
+    batteryLedTierColor(tier, &red, &green, &blue);
+
+    digitalWrite(NEOPIXEL_POWER, LOW);
+    delay(10);
+
+    for (uint8_t i = 0; i < flashes; i++) {
+        showBatteryLedFrame(tier, red, green, blue);
+        delay(onMs);
+        pixels.clear();
+        pixels.show();
+        if (i + 1 < flashes) delay(offMs);
+    }
+
+    digitalWrite(NEOPIXEL_POWER, HIGH);
+}
+
+static void handleBatteryTierTransition(uint8_t batteryPercent) {
+    uint8_t newTier = batteryLedTierFromPercent(batteryPercent);
+    if (rtcLastBatteryLedTier == 255) {
+        rtcLastBatteryLedTier = newTier;
+        return;
+    }
+
+    if (rtcLastBatteryLedTier == 4 && newTier == 3 && !rtcNotified4to3) {
+        rtcBatteryTierFlashPending = true;
+        rtcPendingBatteryLedTier = newTier;
+        rtcNotified4to3 = true;
+    }
+
+    if (rtcLastBatteryLedTier == 2 && newTier == 1 && !rtcNotified2to1) {
+        rtcBatteryTierFlashPending = true;
+        rtcPendingBatteryLedTier = newTier;
+        rtcNotified2to1 = true;
+    }
+
+    rtcLastBatteryLedTier = newTier;
+}
+
+static void resetBatteryTierNotificationsForUsb() {
+    rtcLastBatteryLedTier = 255;
+    rtcBatteryTierFlashPending = false;
+    rtcPendingBatteryLedTier = 0;
+    rtcNotified4to3 = false;
+    rtcNotified2to1 = false;
+}
+
+static void flashPendingBatteryTierIfAny() {
+    if (!usbPowerPresent && rtcBatteryTierFlashPending) {
+        flashBatteryLedTier(rtcPendingBatteryLedTier, 1, BATTERY_LEVEL_FLASH_ON_MS, BATTERY_LEVEL_FLASH_OFF_MS);
+        rtcBatteryTierFlashPending = false;
+    }
+}
+
+static void playBatteryStartupAnimation(uint8_t batteryPercent) {
+    uint8_t tier = batteryLedTierFromPercent(batteryPercent);
+    uint8_t red, green, blue;
+    batteryLedTierColor(tier, &red, &green, &blue);
+
+    digitalWrite(NEOPIXEL_POWER, LOW);
+    delay(10);
+
+    for (uint8_t count = 1; count <= 4; count++) {
+        showBatteryLedFrame(count, red, green, blue);
+        delay(BATTERY_STARTUP_SWEEP_MS);
+    }
+    for (int8_t count = 3; count >= 1; count--) {
+        showBatteryLedFrame((uint8_t)count, red, green, blue);
+        delay(BATTERY_STARTUP_SWEEP_MS);
+    }
+
+    pixels.clear();
+    pixels.show();
+    for (uint8_t i = 0; i < BATTERY_STARTUP_LEVEL_FLASHES; i++) {
+        showBatteryLedFrame(tier, red, green, blue);
+        delay(BATTERY_LEVEL_FLASH_ON_MS);
+        pixels.clear();
+        pixels.show();
+        if (i + 1 < BATTERY_STARTUP_LEVEL_FLASHES) delay(BATTERY_LEVEL_FLASH_OFF_MS);
+    }
+
+    digitalWrite(NEOPIXEL_POWER, HIGH);
+}
+
 static void disableRadios() {
     WiFi.disconnect(true, true);
     WiFi.mode(WIFI_OFF);
@@ -335,6 +579,62 @@ ThinkInk_290_Grayscale4_EAAMFGN display(EPD_DC, EPD_RESET, EPD_CS, -1, -1);
 Adafruit_LIS3DH lis = Adafruit_LIS3DH();
 
 static void flashNeopixelsColor(uint8_t red, uint8_t green, uint8_t blue, uint16_t ms);
+void updateDisplay(float co2, float tempF, float rh);
+
+static void showBatteryWarningMessage(const char *line1, const char *line2, uint32_t durationMs, bool blinkDimRed) {
+    display.clearBuffer();
+    display.fillScreen(bgColor());
+    display.setTextColor(fgColor());
+    display.setTextWrap(false);
+
+    int16_t x1, y1;
+    uint16_t w1, h1;
+    display.setTextSize(2);
+    display.getTextBounds(line1, 0, 0, &x1, &y1, &w1, &h1);
+    int16_t yTop = (display.height() / 2) - 20;
+    int16_t line1X = (display.width() - (int16_t)w1) / 2;
+    display.setCursor(line1X < 0 ? 0 : line1X, yTop);
+    display.print(line1);
+
+    if (line2 && line2[0] != '\0') {
+        int16_t x2, y2;
+        uint16_t w2, h2;
+        display.setTextSize(2);
+        display.getTextBounds(line2, 0, 0, &x2, &y2, &w2, &h2);
+        int16_t line2X = (display.width() - (int16_t)w2) / 2;
+        display.setCursor(line2X < 0 ? 0 : line2X, yTop + 28);
+        display.print(line2);
+    }
+
+    display.display();
+
+    unsigned long startMs = millis();
+    unsigned long lastBlinkMs = startMs;
+    bool ledOn = false;
+
+    while (millis() - startMs < durationMs) {
+        if (blinkDimRed && (millis() - lastBlinkMs >= BATTERY_CRITICAL_BLINK_MS)) {
+            ledOn = !ledOn;
+            pixels.clear();
+            if (ledOn) {
+                for (uint8_t i = 0; i < pixels.numPixels(); ++i) {
+                    pixels.setPixelColor(i, pixels.Color(BATTERY_CRITICAL_LED_R, BATTERY_CRITICAL_LED_G, BATTERY_CRITICAL_LED_B));
+                }
+            }
+            pixels.show();
+            lastBlinkMs = millis();
+        }
+        delay(50);
+    }
+
+    pixels.clear();
+    pixels.show();
+
+    if (hasReading) {
+        updateDisplay(lastCO2, lastTempF, lastRH);
+        lastDisplayMs = millis();
+    }
+}
 
 static void flashSampleIndicator() {
     if (usbPowerPresent) {
@@ -351,6 +651,8 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
     rtcLastTempF      = lastTempF;
     rtcLastRH         = lastRH;
     rtcHasReading     = hasReading;
+    rtcLastUsbPowerPresent = usbPowerPresent;
+    rtcHasUsbPowerState = true;
 
     // Stop SCD30 continuous measurement (only if we started it)
     if (scd30Ready) {
@@ -423,16 +725,16 @@ static void applyButtonAction(uint8_t gpio) {
         carouselModeEnabled = !carouselModeEnabled;
         Serial.printf("Button → carousel: %s\n", carouselModeEnabled ? "ON" : "OFF");
         if (carouselModeEnabled) {
-            flashNeopixelsColor(140, 0, 110, INVERT_FLASH_MS);
+            flashNeopixelsColor(CAROUSEL_ON_FLASH_R, CAROUSEL_ON_FLASH_G, CAROUSEL_ON_FLASH_B, INVERT_FLASH_MS);
         } else {
-            flashNeopixelsColor(255, 0, 0, INVERT_FLASH_MS);
+            flashNeopixelsColor(CAROUSEL_OFF_FLASH_R, CAROUSEL_OFF_FLASH_G, CAROUSEL_OFF_FLASH_B, INVERT_FLASH_MS);
         }
         playModeToggleTone();
     } else if (gpio == INVERT_BTN) {
         inverted = !inverted;
         saveVisualPreferences();
         Serial.printf("Button → invert: %s\n", inverted ? "ON" : "OFF");
-        flashNeopixelsColor(24, 24, 24, INVERT_FLASH_MS);
+        flashNeopixelsColor(INVERT_TOGGLE_FLASH_R, INVERT_TOGGLE_FLASH_G, INVERT_TOGGLE_FLASH_B, INVERT_FLASH_MS);
         playInvertToggleTone();
     } else {
         return;
@@ -508,7 +810,7 @@ static void handleInvertToggleRequest() {
     inverted = !inverted;
     saveVisualPreferences();
     Serial.printf("Display inverted: %s\n", inverted ? "ON" : "OFF");
-    flashNeopixelsColor(24, 24, 24, INVERT_FLASH_MS);
+    flashNeopixelsColor(INVERT_TOGGLE_FLASH_R, INVERT_TOGGLE_FLASH_G, INVERT_TOGGLE_FLASH_B, INVERT_FLASH_MS);
     playInvertToggleTone();
 
     if (hasReading) {
@@ -535,7 +837,7 @@ static void applyPendingInvertToggleIfAny() {
     inverted = !inverted;
     saveVisualPreferences();
     Serial.printf("Display inverted (deferred): %s\n", inverted ? "ON" : "OFF");
-    flashNeopixelsColor(24, 24, 24, INVERT_FLASH_MS);
+    flashNeopixelsColor(INVERT_TOGGLE_FLASH_R, INVERT_TOGGLE_FLASH_G, INVERT_TOGGLE_FLASH_B, INVERT_FLASH_MS);
     playInvertToggleTone();
     if (hasReading) {
         updateDisplay(lastCO2, lastTempF, lastRH);
@@ -562,7 +864,7 @@ static void handleModeCycleRequest() {
 
     advanceDisplayMode();
     Serial.printf("Display mode: %s\n", displayModeName(currentDisplayMode));
-    flashNeopixelsColor(24, 24, 24, INVERT_FLASH_MS);
+    flashNeopixelsColor(MODE_TOGGLE_FLASH_R, MODE_TOGGLE_FLASH_G, MODE_TOGGLE_FLASH_B, INVERT_FLASH_MS);
     playModeToggleTone();
 
     if (hasReading) {
@@ -588,7 +890,7 @@ static void applyPendingModeCycleIfAny() {
 
     advanceDisplayMode();
     Serial.printf("Display mode (deferred): %s\n", displayModeName(currentDisplayMode));
-    flashNeopixelsColor(24, 24, 24, INVERT_FLASH_MS);
+    flashNeopixelsColor(MODE_TOGGLE_FLASH_R, MODE_TOGGLE_FLASH_G, MODE_TOGGLE_FLASH_B, INVERT_FLASH_MS);
     playModeToggleTone();
 
     if (hasReading) {
@@ -616,9 +918,9 @@ static void handleCarouselToggleRequest() {
     carouselModeEnabled = !carouselModeEnabled;
     Serial.printf("Carousel: %s\n", carouselModeEnabled ? "ON" : "OFF");
     if (carouselModeEnabled) {
-        flashNeopixelsColor(140, 0, 110, INVERT_FLASH_MS);
+        flashNeopixelsColor(CAROUSEL_ON_FLASH_R, CAROUSEL_ON_FLASH_G, CAROUSEL_ON_FLASH_B, INVERT_FLASH_MS);
     } else {
-        flashNeopixelsColor(255, 0, 0, INVERT_FLASH_MS);
+        flashNeopixelsColor(CAROUSEL_OFF_FLASH_R, CAROUSEL_OFF_FLASH_G, CAROUSEL_OFF_FLASH_B, INVERT_FLASH_MS);
     }
     playModeToggleTone();
 
@@ -646,9 +948,9 @@ static void applyPendingCarouselToggleIfAny() {
     carouselModeEnabled = !carouselModeEnabled;
     Serial.printf("Carousel (deferred): %s\n", carouselModeEnabled ? "ON" : "OFF");
     if (carouselModeEnabled) {
-        flashNeopixelsColor(140, 0, 110, INVERT_FLASH_MS);
+        flashNeopixelsColor(CAROUSEL_ON_FLASH_R, CAROUSEL_ON_FLASH_G, CAROUSEL_ON_FLASH_B, INVERT_FLASH_MS);
     } else {
-        flashNeopixelsColor(255, 0, 0, INVERT_FLASH_MS);
+        flashNeopixelsColor(CAROUSEL_OFF_FLASH_R, CAROUSEL_OFF_FLASH_G, CAROUSEL_OFF_FLASH_B, INVERT_FLASH_MS);
     }
     playModeToggleTone();
 
@@ -759,7 +1061,7 @@ static void flashNeopixelsColor(uint8_t red, uint8_t green, uint8_t blue, uint16
 // Flash all four neopixels red for FLASH_DURATION_MS, then turn them off.
 // ---------------------------------------------------------------------------
 void flashNeopixelsRed() {
-    flashNeopixelsColor(255, 0, 0, FLASH_DURATION_MS);
+    flashNeopixelsColor(GENERIC_RED_FLASH_R, GENERIC_RED_FLASH_G, GENERIC_RED_FLASH_B, FLASH_DURATION_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -868,28 +1170,6 @@ static bool getWindowMinMax(const float *buf, int n, float *outLo, float *outHi)
 //   Left side:  values right-aligned, vertically centred to each graph row.
 //   Right side: three line graphs (CO2 / Temp / RH) over last 30 min.
 // ---------------------------------------------------------------------------
-// Layout constants  (screen is 296 x 128)
-#define TEXT_RIGHT_BALANCED   140
-#define GRAPH_X_BALANCED      152
-#define GRAPH_W_BALANCED      136
-
-#define TEXT_RIGHT_GRAPH_HEAVY 108
-#define GRAPH_X_GRAPH_HEAVY    120
-#define GRAPH_W_GRAPH_HEAVY    168
-
-// CO2 graph is taller to match the larger text
-#define GRAPH_H_CO2  40
-#define GRAPH_H_STD  30           // temp & RH graphs
-#define GRAPH_GAP    6
-// Total: 40 + 30 + 30 + 2*6 = 112.  Centred: (128-112)/2 = 8
-#define GRAPH_Y0     8
-
-// Screen-edge content padding for enclosure bezel compensation
-#define SCREEN_PAD_LEFT   0
-#define SCREEN_PAD_RIGHT  10
-#define SCREEN_PAD_TOP    0
-#define SCREEN_PAD_BOTTOM 0
-
 void updateDisplay(float co2, float tempF, float rh) {
     uint16_t fg = fgColor();
     int16_t contentLeft = SCREEN_PAD_LEFT;
@@ -1037,6 +1317,7 @@ void updateDisplay(float co2, float tempF, float rh) {
     }
 
     display.display();
+    flashPendingBatteryTierIfAny();
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,7 +1426,7 @@ void setup() {
     pixels.clear();
     pixels.show();
     if (!wokeFromDeepSleep) {
-        flashNeopixelsColor(0, 180, 0, STARTUP_FLASH_MS);
+        flashNeopixelsColor(STARTUP_FLASH_R, STARTUP_FLASH_G, STARTUP_FLASH_B, STARTUP_FLASH_MS);
     }
 
     // ── Speaker ──
@@ -1197,6 +1478,27 @@ void setup() {
     }
 #endif
     usbPowerPresent = detectUsbPowerPresent();
+    float startupBattV = readBatteryVoltage();
+    uint8_t startupBattPct = batteryPercentFromVoltage(startupBattV);
+
+    if (usbPowerPresent) {
+        resetBatteryTierNotificationsForUsb();
+    } else {
+        handleBatteryTierTransition(startupBattPct);
+    }
+
+    if (!wokeFromDeepSleep) {
+        playBatteryStartupAnimation(startupBattPct);
+    }
+
+    if (wokeFromDeepSleep && rtcHasUsbPowerState && !rtcLastUsbPowerPresent && usbPowerPresent) {
+        flashNeopixelsColor(USB_CONNECTED_FLASH_R, USB_CONNECTED_FLASH_G, USB_CONNECTED_FLASH_B, 180);
+        playUsbConnectedJingle();
+    }
+
+    rtcLastUsbPowerPresent = usbPowerPresent;
+    rtcHasUsbPowerState = true;
+
     lastSampleMs = millis();
     lastDisplayMs = millis();
     Serial.printf("Power mode: %s\n", usbPowerPresent ? "USB" : "Battery");
@@ -1252,12 +1554,16 @@ void loop() {
     bool usbNow = detectUsbPowerPresent();
     if (usbNow != usbPowerPresent) {
         usbPowerPresent = usbNow;
+        float battVNow = readBatteryVoltage();
+        uint8_t battPctNow = batteryPercentFromVoltage(battVNow);
         Serial.printf("Power mode changed: %s\n", usbPowerPresent ? "USB" : "Battery");
         if (usbPowerPresent) {
-            flashNeopixelsColor(0, 0, 200, 180);     // USB connected: blue
+            resetBatteryTierNotificationsForUsb();
+            flashNeopixelsColor(USB_CONNECTED_FLASH_R, USB_CONNECTED_FLASH_G, USB_CONNECTED_FLASH_B, 180);
             playUsbConnectedJingle();
         } else {
-            flashNeopixelsColor(220, 90, 0, 180);    // USB disconnected: orange
+            handleBatteryTierTransition(battPctNow);
+            flashBatteryLedTier(batteryLedTierFromPercent(battPctNow), 1, BATTERY_LEVEL_FLASH_ON_MS, BATTERY_LEVEL_FLASH_OFF_MS);
             playUsbDisconnectedJingle();
         }
     }
@@ -1265,24 +1571,49 @@ void loop() {
     if (!usbPowerPresent) {
         const uint32_t sleepPollMs = BATTERY_USB_POLL_INTERVAL_MS;
 
+        float battV = readBatteryVoltage();
+
         // Handle button wake: apply the pressed button's action
         if (buttonWakeGPIO != 0) {
             applyButtonAction(buttonWakeGPIO);
             buttonWakeGPIO = 0;
         }
-
-        float battV = readBatteryVoltage();
         uint8_t battPct = batteryPercentFromVoltage(battV);
+        handleBatteryTierTransition(battPct);
 
-        if (battPct < LOW_BATTERY_PERCENT) {
-            lowBatteryElapsedMs += sleepPollMs;
-            if (lowBatteryElapsedMs >= LOW_BATTERY_FLASH_INTERVAL_MS) {
-                Serial.printf("Low battery warning: %.2fV (%u%%)\n", battV, battPct);
-                flashNeopixelsRed();
-                lowBatteryElapsedMs = 0;
+        bool showWarn50 = false;
+        bool showCriticalWarn = false;
+
+        if (battPct <= BATTERY_CRITICAL_PERCENT) {
+            uint32_t newElapsed = batteryCriticalElapsedMs + sleepPollMs;
+            if (newElapsed < batteryCriticalElapsedMs) newElapsed = BATTERY_CRITICAL_INTERVAL_MS;
+            batteryCriticalElapsedMs = newElapsed;
+
+            if (batteryCriticalElapsedMs >= BATTERY_CRITICAL_INTERVAL_MS) {
+                showCriticalWarn = true;
+                batteryCriticalElapsedMs = 0;
             }
         } else {
-            lowBatteryElapsedMs = 0;
+            batteryCriticalElapsedMs = 0;
+        }
+
+        if (battPct <= BATTERY_WARN_50_PERCENT && battPct > BATTERY_CRITICAL_PERCENT) {
+            if (!batteryWarn50Shown) {
+                showWarn50 = true;
+                batteryWarn50Shown = true;
+            }
+        } else {
+            if (battPct > BATTERY_WARN_50_PERCENT) {
+                batteryWarn50Shown = false;
+            }
+        }
+
+        if (showCriticalWarn) {
+            Serial.printf("Critical battery warning: %.2fV (%u%%)\n", battV, battPct);
+            showBatteryWarningMessage("Battery is at 10%,", "please recharge!", BATTERY_CRITICAL_DURATION_MS, true);
+        } else if (showWarn50) {
+            Serial.printf("Battery 50%% warning: %.2fV (%u%%)\n", battV, battPct);
+            showBatteryWarningMessage("Battery at 50%", "", BATTERY_WARN_50_DURATION_MS, false);
         }
 
         if (batterySampleElapsedMs < BATTERY_SAMPLE_INTERVAL_MS) {
@@ -1405,6 +1736,7 @@ void loop() {
                 {
                     float uBattV = readBatteryVoltage();
                     uint8_t uBattPct = batteryPercentFromVoltage(uBattV);
+                    handleBatteryTierTransition(uBattPct);
                     Serial.printf("CO2: %.0f ppm | Temp: %.1f F | RH: %.1f %% | Batt: %.2fV (%u%%)\n",
                                    co2, tempF, rh, uBattV, uBattPct);
                 }

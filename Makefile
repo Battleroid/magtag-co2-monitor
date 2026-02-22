@@ -42,9 +42,7 @@ src/%.h: $$(firstword $$(wildcard assets/images/%.png assets/images/%.jpg assets
 	$(PYTHON) tools/image_to_epd_bitmap.py \
 		--input "$<" \
 		--output "$@" \
-		--symbol "$(call to_camel,$*)" \
-		--width $(IMAGE_WIDTH) \
-		--height $(IMAGE_HEIGHT)
+		--symbol "$(call to_camel,$*)"
 
 # Convert a single image (backward-compatible).
 # Example: make image IMAGE_INPUT=assets/images/smile.png IMAGE_OUTPUT=src/smile.h IMAGE_SYMBOL=smile
