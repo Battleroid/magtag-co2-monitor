@@ -8,6 +8,7 @@
 #include <freertos/task.h>
 #include <USB.h>
 #include <esp_sleep.h>
+#include <driver/rtc_io.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #ifdef CONFIG_BT_ENABLED
@@ -32,7 +33,7 @@
 #define GRAPH_WINDOW_SAMPLES ((GRAPH_WINDOW_MINUTES * 60 * 1000) / CYCLE_INTERVAL_MS)
 
 #define USB_SAMPLE_INTERVAL_MS      15000
-#define USB_DISPLAY_INTERVAL_MS     60000
+#define USB_DISPLAY_INTERVAL_MS     30000
 #define BATTERY_SAMPLE_INTERVAL_MS  60000
 #define BATTERY_DISPLAY_INTERVAL_MS 300000
 #define BATTERY_USB_POLL_INTERVAL_MS 10000
@@ -136,6 +137,7 @@ RTC_DATA_ATTR static uint32_t batterySampleElapsedMs = BATTERY_SAMPLE_INTERVAL_M
 // RTC-persisted state (survives deep sleep)
 RTC_DATA_ATTR static uint8_t  rtcDisplayMode       = DISPLAY_MODE_COMBINED;
 RTC_DATA_ATTR static bool     rtcCarouselEnabled    = false;
+RTC_DATA_ATTR static bool     rtcInverted           = false;
 RTC_DATA_ATTR static float    rtcLastCO2            = 0;
 RTC_DATA_ATTR static float    rtcLastTempF          = 0;
 RTC_DATA_ATTR static float    rtcLastRH             = 0;
@@ -344,6 +346,7 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
     // Persist state to RTC memory before sleeping
     rtcDisplayMode    = currentDisplayMode;
     rtcCarouselEnabled = carouselModeEnabled;
+    rtcInverted       = inverted;
     rtcLastCO2        = lastCO2;
     rtcLastTempF      = lastTempF;
     rtcLastRH         = lastRH;
@@ -383,6 +386,16 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
 
     // Keep RTC peripherals powered so internal pull-ups stay active
     esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+
+    // Explicitly enable RTC-domain pull-ups on button GPIOs to prevent
+    // floating inputs from triggering spurious ext1 wakes during sleep.
+    const gpio_num_t btnPins[] = { (gpio_num_t)INVERT_BTN, (gpio_num_t)CAROUSEL_BTN, (gpio_num_t)MODE_BTN };
+    for (auto pin : btnPins) {
+        rtc_gpio_init(pin);
+        rtc_gpio_set_direction(pin, RTC_GPIO_MODE_INPUT_ONLY);
+        rtc_gpio_pullup_en(pin);
+        rtc_gpio_pulldown_dis(pin);
+    }
 
     float _battV = readBatteryVoltage();
     uint8_t _battPct = batteryPercentFromVoltage(_battV);
@@ -980,53 +993,67 @@ void showStartupImage() {
 // Setup
 // ---------------------------------------------------------------------------
 void setup() {
-    Serial.begin(115200);
-    delay(2000);
-    Serial.println("MagTag CO2 Monitor starting...");
+    // ── CRITICAL: detect wake cause and capture button state BEFORE any delays ──
+    // The ext1 wakeup status register is only valid immediately after wake;
+    // button may already be released by the time Serial.begin returns.
+    esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+    wokeFromDeepSleep = (wakeCause != ESP_SLEEP_WAKEUP_UNDEFINED);
 
-    // Configure button GPIOs early so we can debounce ext1 wakes
+    // Configure button GPIOs and sample state immediately
     pinMode(INVERT_BTN, INPUT_PULLUP);
     pinMode(MODE_BTN, INPUT_PULLUP);
     pinMode(CAROUSEL_BTN, INPUT_PULLUP);
 
-    esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
-    wokeFromDeepSleep = (wakeCause != ESP_SLEEP_WAKEUP_UNDEFINED);
-
-    // Detect which button caused wake (if any)
+    // Detect which button caused wake from the ext1 status register,
+    // then immediately verify the pin is still LOW to filter noise.
+    // This runs within microseconds of boot — real presses (>50 ms)
+    // are still held; noise glitches are not.
     buttonWakeGPIO = 0;
     if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
         uint64_t wakeStatus = esp_sleep_get_ext1_wakeup_status();
-        if (wakeStatus & (1ULL << MODE_BTN))      buttonWakeGPIO = MODE_BTN;
+        if (wakeStatus & (1ULL << MODE_BTN))        buttonWakeGPIO = MODE_BTN;
         else if (wakeStatus & (1ULL << CAROUSEL_BTN)) buttonWakeGPIO = CAROUSEL_BTN;
         else if (wakeStatus & (1ULL << INVERT_BTN))   buttonWakeGPIO = INVERT_BTN;
 
-        // Debounce: verify the button is actually held (guards against noise-triggered ext1 wake)
-        if (buttonWakeGPIO != 0) {
-            delay(50);
-            if (digitalRead(buttonWakeGPIO) != LOW) {
-                Serial.printf("Spurious ext1 wake GPIO %d — ignoring\n", buttonWakeGPIO);
-                buttonWakeGPIO = 0;
-            } else {
-                Serial.printf("Button wake: GPIO %d (confirmed)\n", buttonWakeGPIO);
-            }
+        // Immediate pin check — no delay, just verify the button is actually held
+        if (buttonWakeGPIO != 0 && digitalRead(buttonWakeGPIO) != LOW) {
+            buttonWakeGPIO = 0;  // spurious ext1 wake from noise
         }
     }
 
-    // Restore RTC-persisted state
+    // Restore RTC-persisted state immediately (no NVS needed)
     if (wokeFromDeepSleep) {
         currentDisplayMode  = rtcDisplayMode;
         carouselModeEnabled = rtcCarouselEnabled;
+        inverted            = rtcInverted;
         lastCO2             = rtcLastCO2;
         lastTempF           = rtcLastTempF;
         lastRH              = rtcLastRH;
         hasReading          = rtcHasReading;
     }
 
+    // Now safe to start serial (short delay for deep sleep wake)
+    Serial.begin(115200);
+    if (wokeFromDeepSleep) {
+        delay(200);
+    } else {
+        delay(2000);
+    }
+
+    if (buttonWakeGPIO != 0) {
+        Serial.printf("Button wake: GPIO %d\n", buttonWakeGPIO);
+    }
+    Serial.println("MagTag CO2 Monitor starting...");
+
     prefsReady = prefs.begin(PREFS_NAMESPACE, false);
     if (!prefsReady) {
         Serial.println("WARNING: failed to open preferences namespace");
     }
-    loadVisualPreferences();
+    // On cold boot, load visual prefs from NVS.
+    // On deep sleep wake, RTC memory already has the correct state.
+    if (!wokeFromDeepSleep) {
+        loadVisualPreferences();
+    }
     disableRadios();
 
     // ── Neopixels ──
