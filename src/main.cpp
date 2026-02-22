@@ -10,6 +10,13 @@
 #include <esp_sleep.h>
 #include <Preferences.h>
 
+#if __has_include("startup_image.h")
+#include "startup_image.h"
+#define HAS_STARTUP_IMAGE 1
+#else
+#define HAS_STARTUP_IMAGE 0
+#endif
+
 // ---------------------------------------------------------------------------
 // Timing
 // ---------------------------------------------------------------------------
@@ -634,6 +641,17 @@ void showStatus(const char *msg) {
     display.display();
 }
 
+void showStartupImage() {
+#if HAS_STARTUP_IMAGE
+    display.clearBuffer();
+    if (inverted) display.fillScreen(EPD_BLACK);
+    display.drawBitmap(0, 0, STARTUP_IMAGE_BITMAP, STARTUP_IMAGE_WIDTH, STARTUP_IMAGE_HEIGHT, fgColor());
+    display.display();
+#else
+    showStatus("Started");
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -686,8 +704,8 @@ void setup() {
     // ── E-ink display ──
     display.begin(THINKINK_MONO);
     if (!wokeFromDeepSleep) {
-        showStatus("Started");
-        Serial.println("Display: Started");
+        showStartupImage();
+        Serial.println("Display: Startup image");
     }
 
 #if CONFIG_TINYUSB_ENABLED

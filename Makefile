@@ -1,6 +1,10 @@
-.PHONY: build upload monitor clean all install
+.PHONY: build upload monitor clean all install image
 
 PLATFORMIO := platformio
+PYTHON := python3
+IMAGE_INPUT ?= smile.png
+IMAGE_OUTPUT ?= src/startup_image.h
+IMAGE_SYMBOL ?= startupImage
 
 # Build firmware
 build:
@@ -17,6 +21,16 @@ upload:
 # Open serial monitor (115200 baud)
 monitor:
 	$(PLATFORMIO) device monitor
+
+# Convert an image for startup bitmap rendering on MagTag e-ink.
+# Example: make image IMAGE_INPUT=smile.png
+image:
+	$(PYTHON) tools/image_to_epd_bitmap.py \
+		--input "$(IMAGE_INPUT)" \
+		--output "$(IMAGE_OUTPUT)" \
+		--symbol "$(IMAGE_SYMBOL)" \
+		--width 296 \
+		--height 128
 
 # Build, upload, and open serial monitor
 all: upload monitor
