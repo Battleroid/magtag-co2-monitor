@@ -718,15 +718,21 @@ static void carouselButtonTask(void *param) {
     bool pressedPrev = false;
     unsigned long downAt = 0;
 
+    Serial.printf("Carousel task started, GPIO %d, initial=%s\n",
+                  CAROUSEL_BTN, digitalRead(CAROUSEL_BTN) == LOW ? "LOW" : "HIGH");
+
     while (true) {
         bool pressed = (digitalRead(CAROUSEL_BTN) == LOW);
 
         if (pressed && !pressedPrev) {
             downAt = millis();
+            Serial.println("Carousel btn: pressed");
         }
 
         if (!pressed && pressedPrev) {
-            if (millis() - downAt >= 40) {
+            unsigned long held = millis() - downAt;
+            Serial.printf("Carousel btn: released (%lu ms)\n", held);
+            if (held >= 40) {
                 handleCarouselToggleRequest();
             }
         }
@@ -1192,9 +1198,9 @@ void setup() {
     // Button polling tasks are only useful in USB mode where we stay awake.
     // In battery mode, buttons wake the device via ext1 interrupt instead.
     if (usbPowerPresent) {
-        xTaskCreate(invertButtonTask, "invert_btn", 4096, nullptr, 1, nullptr);
-        xTaskCreate(modeButtonTask, "mode_btn", 4096, nullptr, 1, nullptr);
-        xTaskCreate(carouselButtonTask, "carousel_btn", 4096, nullptr, 1, nullptr);
+        xTaskCreate(invertButtonTask, "invert_btn", 8192, nullptr, 1, nullptr);
+        xTaskCreate(modeButtonTask, "mode_btn", 8192, nullptr, 1, nullptr);
+        xTaskCreate(carouselButtonTask, "carousel_btn", 8192, nullptr, 1, nullptr);
     }
 
     if (!wokeFromDeepSleep) {
