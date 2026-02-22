@@ -9,6 +9,10 @@
 #include <USB.h>
 #include <esp_sleep.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#ifdef CONFIG_BT_ENABLED
+#include <esp_bt.h>
+#endif
 
 #if __has_include("startup_image.h")
 #include "startup_image.h"
@@ -277,6 +281,16 @@ static bool detectUsbPowerPresent() {
     return usbEnum || usbByHeuristic;
 }
 
+static void disableRadios() {
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+#ifdef CONFIG_BT_ENABLED
+    if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        esp_bt_controller_disable();
+    }
+#endif
+}
+
 static uint32_t currentSampleIntervalMs() {
     return usbPowerPresent ? USB_SAMPLE_INTERVAL_MS : BATTERY_SAMPLE_INTERVAL_MS;
 }
@@ -301,6 +315,7 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
         Serial.println("SCD30 measurement stopped before deep sleep");
     }
 
+    disableRadios();
     digitalWrite(NEOPIXEL_POWER, HIGH);
     digitalWrite(SPEAKER_SHUTDOWN, LOW);
 
@@ -886,6 +901,7 @@ void setup() {
         Serial.println("WARNING: failed to open preferences namespace");
     }
     loadVisualPreferences();
+    disableRadios();
 
     // ── Neopixels ──
     pinMode(NEOPIXEL_POWER, OUTPUT);
