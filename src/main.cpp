@@ -44,6 +44,7 @@
 #define LOW_BATTERY_FLASH_INTERVAL_MS 900000UL
 #define SCD30_I2C_ADDR                0x61
 #define SCD30_CMD_STOP_MEASUREMENTS   0x0104
+#define SCD30_WARMUP_MS               25000  // cold-start warm-up for accurate readings
 #define GRAPH_LINE_THICKNESS           1
 
 #define BATTERY_DISPLAY_EVERY_N ((BATTERY_DISPLAY_INTERVAL_MS / BATTERY_SAMPLE_INTERVAL_MS) > 0 ? (BATTERY_DISPLAY_INTERVAL_MS / BATTERY_SAMPLE_INTERVAL_MS) : 1)
@@ -125,10 +126,24 @@ static float batteryVoltageFiltered = 0.0f;
 static unsigned long lastPowerCheckMs = 0;
 static int usbHeuristicScore = 0;
 static bool usbByHeuristic = false;
+
+// USB event-driven mount tracking (set from TinyUSB task context)
+static volatile bool usbMounted = false;
 RTC_DATA_ATTR static uint32_t batterySampleCycles = 0;
 RTC_DATA_ATTR static uint32_t lowBatteryElapsedMs = 0;
 RTC_DATA_ATTR static uint32_t batterySampleElapsedMs = BATTERY_SAMPLE_INTERVAL_MS;
+
+// RTC-persisted state (survives deep sleep)
+RTC_DATA_ATTR static uint8_t  rtcDisplayMode       = DISPLAY_MODE_COMBINED;
+RTC_DATA_ATTR static bool     rtcCarouselEnabled    = false;
+RTC_DATA_ATTR static float    rtcLastCO2            = 0;
+RTC_DATA_ATTR static float    rtcLastTempF          = 0;
+RTC_DATA_ATTR static float    rtcLastRH             = 0;
+RTC_DATA_ATTR static bool     rtcHasReading         = false;
+
 static bool wokeFromDeepSleep = false;
+static uint8_t buttonWakeGPIO = 0;   // which button GPIO caused wake (0 = none)
+static bool scd30Ready = false;      // whether SCD30 was initialized this wake cycle
 static Preferences prefs;
 static bool prefsReady = false;
 
@@ -253,12 +268,11 @@ static void playUsbDisconnectedJingle() {
 }
 
 static bool detectUsbPowerPresent() {
-#if CONFIG_TINYUSB_ENABLED
-    bool usbEnum = (bool)USB;
-#else
-    bool usbEnum = false;
-#endif
+    // Primary: event-driven mount state (instant on plug/unplug)
+    bool mounted = usbMounted;
+    static bool prevMounted = false;
 
+    // Secondary: voltage heuristic for dumb chargers that don't enumerate
     unsigned long now = millis();
     if (lastPowerCheckMs == 0 || now - lastPowerCheckMs >= POWER_CHECK_INTERVAL_MS) {
         float voltage = readBatteryVoltage();
@@ -273,12 +287,23 @@ static bool detectUsbPowerPresent() {
         lastPowerCheckMs = now;
     }
 
-    if (usbEnum) {
+    if (mounted) {
+        // USB enumerated — force heuristic high
         usbByHeuristic = true;
         usbHeuristicScore = 3;
+    } else if (prevMounted && !mounted) {
+        // USB just unmounted — immediately reset heuristic
+        usbByHeuristic = false;
+        usbHeuristicScore = 0;
+        Serial.println("USB unmount — heuristic reset");
     }
 
-    return usbEnum || usbByHeuristic;
+    if (prevMounted != mounted) {
+        Serial.printf("USB mount state: %s\n", mounted ? "MOUNTED" : "UNMOUNTED");
+    }
+    prevMounted = mounted;
+
+    return mounted || usbByHeuristic;
 }
 
 static void disableRadios() {
@@ -299,6 +324,14 @@ static uint32_t currentDisplayIntervalMs() {
     return usbPowerPresent ? USB_DISPLAY_INTERVAL_MS : BATTERY_DISPLAY_INTERVAL_MS;
 }
 
+// ---------------------------------------------------------------------------
+// Globals  (board-defined pins from MagTag variant header)
+// ---------------------------------------------------------------------------
+Adafruit_SCD30  scd30;
+Adafruit_NeoPixel pixels(4, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
+ThinkInk_290_Grayscale4_EAAMFGN display(EPD_DC, EPD_RESET, EPD_CS, -1, -1);
+Adafruit_LIS3DH lis = Adafruit_LIS3DH();
+
 static void flashNeopixelsColor(uint8_t red, uint8_t green, uint8_t blue, uint16_t ms);
 
 static void flashSampleIndicator() {
@@ -308,20 +341,53 @@ static void flashSampleIndicator() {
 }
 
 static void enterDeepSleepMs(uint32_t sleepMs) {
-    bool stopOk = stopScd30Measurements();
-    if (!stopOk) {
-        Serial.println("Warning: failed to send SCD30 stop command");
-    } else {
-        Serial.println("SCD30 measurement stopped before deep sleep");
+    // Persist state to RTC memory before sleeping
+    rtcDisplayMode    = currentDisplayMode;
+    rtcCarouselEnabled = carouselModeEnabled;
+    rtcLastCO2        = lastCO2;
+    rtcLastTempF      = lastTempF;
+    rtcLastRH         = lastRH;
+    rtcHasReading     = hasReading;
+
+    // Stop SCD30 continuous measurement (only if we started it)
+    if (scd30Ready) {
+        bool stopOk = stopScd30Measurements();
+        if (!stopOk) {
+            Serial.println("Warning: failed to send SCD30 stop command");
+        } else {
+            Serial.println("SCD30 measurement stopped before deep sleep");
+        }
+        scd30Ready = false;
     }
 
     disableRadios();
+
+    // Power down e-ink display (software + hardware reset low)
+    display.powerDown();
+    digitalWrite(EPD_RESET, LOW);
+
+    // Power down LIS3DH accelerometer
+    lis.setDataRate(LIS3DH_DATARATE_POWERDOWN);
+
+    // Power off NeoPixels and speaker amp
     digitalWrite(NEOPIXEL_POWER, HIGH);
     digitalWrite(SPEAKER_SHUTDOWN, LOW);
 
-    Serial.printf("Battery mode deep sleep for %lu ms\n", (unsigned long)sleepMs);
-    Serial.flush();
+    // --- Wake sources ---
+    // Timer wake for periodic sampling
     esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
+
+    // Button wake: D15 (invert), D14 (carousel), D12 (mode) — active-low
+    uint64_t buttonMask = (1ULL << INVERT_BTN) | (1ULL << CAROUSEL_BTN) | (1ULL << MODE_BTN);
+    esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ANY_LOW);
+
+    // Keep RTC peripherals powered so internal pull-ups stay active
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+
+    float _battV = readBatteryVoltage();
+    uint8_t _battPct = batteryPercentFromVoltage(_battV);
+    Serial.printf("Deep sleep %lu ms | Batt: %.2fV (%u%%)\n", (unsigned long)sleepMs, _battV, _battPct);
+    Serial.flush();
     esp_deep_sleep_start();
 }
 
@@ -588,14 +654,6 @@ static void carouselButtonTask(void *param) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Globals  (board-defined pins from MagTag variant header)
-// ---------------------------------------------------------------------------
-Adafruit_SCD30  scd30;
-Adafruit_NeoPixel pixels(4, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
-ThinkInk_290_Grayscale4_EAAMFGN display(EPD_DC, EPD_RESET, EPD_CS, -1, -1);
-Adafruit_LIS3DH lis = Adafruit_LIS3DH();
-
 static void flashNeopixelsColor(uint8_t red, uint8_t green, uint8_t blue, uint16_t ms) {
     digitalWrite(NEOPIXEL_POWER, LOW);
     delay(10);
@@ -727,9 +785,9 @@ static bool getWindowMinMax(const float *buf, int n, float *outLo, float *outHi)
 #define GRAPH_X_BALANCED      152
 #define GRAPH_W_BALANCED      136
 
-#define TEXT_RIGHT_GRAPH_HEAVY 88
-#define GRAPH_X_GRAPH_HEAVY    100
-#define GRAPH_W_GRAPH_HEAVY    188
+#define TEXT_RIGHT_GRAPH_HEAVY 108
+#define GRAPH_X_GRAPH_HEAVY    120
+#define GRAPH_W_GRAPH_HEAVY    168
 
 // CO2 graph is taller to match the larger text
 #define GRAPH_H_CO2  40
@@ -740,7 +798,7 @@ static bool getWindowMinMax(const float *buf, int n, float *outLo, float *outHi)
 
 // Screen-edge content padding for enclosure bezel compensation
 #define SCREEN_PAD_LEFT   0
-#define SCREEN_PAD_RIGHT  0
+#define SCREEN_PAD_RIGHT  10
 #define SCREEN_PAD_TOP    0
 #define SCREEN_PAD_BOTTOM 0
 
@@ -795,14 +853,17 @@ void updateDisplay(float co2, float tempF, float rh) {
         const float *metricBuf = histCO2;
         float currentVal = co2;
         int decimals = 0;
+        const char *suffix = "";
         if (currentDisplayMode == DISPLAY_MODE_TEMP_ONLY) {
             metricBuf = histTempF;
             currentVal = tempF;
             decimals = 1;
+            suffix = "F";
         } else if (currentDisplayMode == DISPLAY_MODE_RH_ONLY) {
             metricBuf = histRH;
             currentVal = rh;
             decimals = 1;
+            suffix = "%";
         }
 
         float lo = currentVal, hi = currentVal;
@@ -817,18 +878,46 @@ void updateDisplay(float co2, float tempF, float rh) {
         int16_t yHigh = contentTop + (contentH / 2) - 8;
         int16_t yLow = contentBottom - 20;
 
-        display.setTextSize(3);
         if (decimals == 0) snprintf(buf, sizeof(buf), "%d", (int)currentVal);
         else snprintf(buf, sizeof(buf), "%.1f", currentVal);
-        printRightAligned(textRight, yCurrent, buf);
+        {
+            // Try size 3 for number; fall back to size 2 if it won't fit
+            int16_t x1, y1;
+            uint16_t numW, numH, sfxW = 0;
+            int numSize = 3;
+            display.setTextSize(3);
+            display.getTextBounds(buf, 0, 0, &x1, &y1, &numW, &numH);
+            if (suffix[0] != '\0') {
+                display.setTextSize(2);
+                uint16_t sfxH;
+                display.getTextBounds(suffix, 0, 0, &x1, &y1, &sfxW, &sfxH);
+            }
+            if ((int16_t)numW + (int16_t)sfxW > textRight) {
+                numSize = 2;
+                display.setTextSize(2);
+                display.getTextBounds(buf, 0, 0, &x1, &y1, &numW, &numH);
+            }
+            int16_t totalW = (int16_t)numW + (int16_t)sfxW;
+            int16_t xStart = textRight - totalW;
+            display.setTextSize(numSize);
+            display.setCursor(xStart, yCurrent);
+            display.print(buf);
+            if (suffix[0] != '\0') {
+                display.setTextSize(2);
+                // Align baselines: size 3 = 21px, size 2 = 14px
+                int16_t yOff = (numSize == 3) ? (21 - 14) : 0;
+                display.setCursor(xStart + (int16_t)numW, yCurrent + yOff);
+                display.print(suffix);
+            }
+        }
 
         display.setTextSize(2);
-        if (decimals == 0) snprintf(buf, sizeof(buf), "%d", (int)hi);
-        else snprintf(buf, sizeof(buf), "%.1f", hi);
+        if (decimals == 0) snprintf(buf, sizeof(buf), "%d%s", (int)hi, suffix);
+        else snprintf(buf, sizeof(buf), "%.1f%s", hi, suffix);
         printRightAligned(textRight, yHigh, buf);
 
-        if (decimals == 0) snprintf(buf, sizeof(buf), "%d", (int)lo);
-        else snprintf(buf, sizeof(buf), "%.1f", lo);
+        if (decimals == 0) snprintf(buf, sizeof(buf), "%d%s", (int)lo, suffix);
+        else snprintf(buf, sizeof(buf), "%.1f%s", lo, suffix);
         printRightAligned(textRight, yLow, buf);
 
         drawGraph(metricBuf, n, graphX, contentTop + 2, graphW, contentH - 4);
@@ -894,7 +983,44 @@ void setup() {
     Serial.begin(115200);
     delay(2000);
     Serial.println("MagTag CO2 Monitor starting...");
-    wokeFromDeepSleep = (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED);
+
+    // Configure button GPIOs early so we can debounce ext1 wakes
+    pinMode(INVERT_BTN, INPUT_PULLUP);
+    pinMode(MODE_BTN, INPUT_PULLUP);
+    pinMode(CAROUSEL_BTN, INPUT_PULLUP);
+
+    esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+    wokeFromDeepSleep = (wakeCause != ESP_SLEEP_WAKEUP_UNDEFINED);
+
+    // Detect which button caused wake (if any)
+    buttonWakeGPIO = 0;
+    if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
+        uint64_t wakeStatus = esp_sleep_get_ext1_wakeup_status();
+        if (wakeStatus & (1ULL << MODE_BTN))      buttonWakeGPIO = MODE_BTN;
+        else if (wakeStatus & (1ULL << CAROUSEL_BTN)) buttonWakeGPIO = CAROUSEL_BTN;
+        else if (wakeStatus & (1ULL << INVERT_BTN))   buttonWakeGPIO = INVERT_BTN;
+
+        // Debounce: verify the button is actually held (guards against noise-triggered ext1 wake)
+        if (buttonWakeGPIO != 0) {
+            delay(50);
+            if (digitalRead(buttonWakeGPIO) != LOW) {
+                Serial.printf("Spurious ext1 wake GPIO %d — ignoring\n", buttonWakeGPIO);
+                buttonWakeGPIO = 0;
+            } else {
+                Serial.printf("Button wake: GPIO %d (confirmed)\n", buttonWakeGPIO);
+            }
+        }
+    }
+
+    // Restore RTC-persisted state
+    if (wokeFromDeepSleep) {
+        currentDisplayMode  = rtcDisplayMode;
+        carouselModeEnabled = rtcCarouselEnabled;
+        lastCO2             = rtcLastCO2;
+        lastTempF           = rtcLastTempF;
+        lastRH              = rtcLastRH;
+        hasReading          = rtcHasReading;
+    }
 
     prefsReady = prefs.begin(PREFS_NAMESPACE, false);
     if (!prefsReady) {
@@ -925,12 +1051,7 @@ void setup() {
     analogReadResolution(12);
     analogSetAttenuation(ADC_11db);
 
-    // ── Invert button (D15) ──
-    pinMode(INVERT_BTN, INPUT_PULLUP);
-    // ── Mode cycle button (D12) ──
-    pinMode(MODE_BTN, INPUT_PULLUP);
-    // ── Carousel toggle button (D14) ──
-    pinMode(CAROUSEL_BTN, INPUT_PULLUP);
+    // Button GPIOs already configured above (before ext1 debounce)
 
     // ── LIS3DH accelerometer (on-board) ──
     if (!lis.begin(0x19)) {
@@ -947,19 +1068,38 @@ void setup() {
     }
 
 #if CONFIG_TINYUSB_ENABLED
+    // Register USB mount/unmount event callbacks for instant power detection
+    USB.onEvent(ARDUINO_USB_STARTED_EVENT, [](void *arg, esp_event_base_t base, int32_t id, void *data) {
+        usbMounted = true;
+        Serial.println("USB event: MOUNTED");
+    });
+    USB.onEvent(ARDUINO_USB_STOPPED_EVENT, [](void *arg, esp_event_base_t base, int32_t id, void *data) {
+        usbMounted = false;
+        Serial.println("USB event: UNMOUNTED");
+    });
     USB.begin();
+
+    // Seed mount state from current TinyUSB status — on ESP32-S2 with
+    // ARDUINO_USB_CDC_ON_BOOT the stack is already running before setup(),
+    // so the mount event may have already fired before our callback was
+    // registered.  The event callbacks handle subsequent plug/unplug.
+    usbMounted = (bool)USB;
+    if (usbMounted) {
+        Serial.println("USB already mounted at startup");
+    }
 #endif
     usbPowerPresent = detectUsbPowerPresent();
     lastSampleMs = millis();
     lastDisplayMs = millis();
     Serial.printf("Power mode: %s\n", usbPowerPresent ? "USB" : "Battery");
 
-    // ── D15 long-press listener task (runs continuously) ──
-    xTaskCreate(invertButtonTask, "invert_btn", 4096, nullptr, 1, nullptr);
-    // ── D12 mode-cycle button task ──
-    xTaskCreate(modeButtonTask, "mode_btn", 4096, nullptr, 1, nullptr);
-    // ── D14 carousel toggle button task ──
-    xTaskCreate(carouselButtonTask, "carousel_btn", 4096, nullptr, 1, nullptr);
+    // Button polling tasks are only useful in USB mode where we stay awake.
+    // In battery mode, buttons wake the device via ext1 interrupt instead.
+    if (usbPowerPresent) {
+        xTaskCreate(invertButtonTask, "invert_btn", 4096, nullptr, 1, nullptr);
+        xTaskCreate(modeButtonTask, "mode_btn", 4096, nullptr, 1, nullptr);
+        xTaskCreate(carouselButtonTask, "carousel_btn", 4096, nullptr, 1, nullptr);
+    }
 
     if (!wokeFromDeepSleep) {
         delay(5000);
@@ -968,13 +1108,29 @@ void setup() {
     // ── I2C + SCD-30 sensor ──
     Wire.begin(SDA, SCL);
 
-    if (!scd30.begin()) {
-        Serial.println("ERROR: SCD-30 not found – check wiring");
-        showStatus("Sensor not found!");
-        while (true) { delay(1000); }
-    }
+    // In battery mode, only start the SCD30 when it's actually sample time.
+    // This avoids wasting power on warm-up during poll-only/button wakes.
+    bool needScd30 = usbPowerPresent || !wokeFromDeepSleep
+                     || batterySampleElapsedMs >= BATTERY_SAMPLE_INTERVAL_MS;
 
-    Serial.println("SCD-30 initialised");
+    if (needScd30) {
+        if (!scd30.begin()) {
+            Serial.println("ERROR: SCD-30 not found – check wiring");
+            showStatus("Sensor not found!");
+            while (true) { delay(1000); }
+        }
+        scd30Ready = true;
+        Serial.println("SCD-30 initialised");
+
+        // After deep sleep the sensor was fully off; it needs ~25 s of
+        // continuous measurement before the readings are accurate.
+        if (!usbPowerPresent && wokeFromDeepSleep) {
+            Serial.printf("SCD30 warm-up: %d ms\n", SCD30_WARMUP_MS);
+            delay(SCD30_WARMUP_MS);
+        }
+    } else {
+        Serial.println("SCD30 skipped (poll-only wake)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -999,6 +1155,37 @@ void loop() {
 
     if (!usbPowerPresent) {
         const uint32_t sleepPollMs = BATTERY_USB_POLL_INTERVAL_MS;
+
+        // Handle button wake: apply the pressed button's action
+        if (buttonWakeGPIO != 0) {
+            if (buttonWakeGPIO == MODE_BTN) {
+                advanceDisplayMode();
+                Serial.printf("Button wake → mode: %s\n", displayModeName(currentDisplayMode));
+                playModeToggleTone();
+            } else if (buttonWakeGPIO == CAROUSEL_BTN) {
+                carouselModeEnabled = !carouselModeEnabled;
+                Serial.printf("Button wake → carousel: %s\n", carouselModeEnabled ? "ON" : "OFF");
+                if (carouselModeEnabled) {
+                    flashNeopixelsColor(140, 0, 110, INVERT_FLASH_MS);
+                } else {
+                    flashNeopixelsColor(255, 0, 0, INVERT_FLASH_MS);
+                }
+                playModeToggleTone();
+            } else if (buttonWakeGPIO == INVERT_BTN) {
+                inverted = !inverted;
+                saveVisualPreferences();
+                Serial.printf("Button wake → invert: %s\n", inverted ? "ON" : "OFF");
+                flashNeopixelsColor(24, 24, 24, INVERT_FLASH_MS);
+                playInvertToggleTone();
+            }
+
+            // Force display update with last known readings
+            if (hasReading) {
+                updateDisplay(lastCO2, lastTempF, lastRH);
+                lastDisplayMs = millis();
+            }
+            buttonWakeGPIO = 0;
+        }
 
         float battV = readBatteryVoltage();
         uint8_t battPct = batteryPercentFromVoltage(battV);
@@ -1028,6 +1215,13 @@ void loop() {
 
         bool sampled = false;
 
+        // Safety: if SCD30 wasn't started (shouldn't happen), go back to sleep
+        if (!scd30Ready) {
+            Serial.println("SCD30 not ready at sample time – sleeping");
+            enterDeepSleepMs(sleepPollMs);
+            return;
+        }
+
         unsigned long waitStart = millis();
         while (!scd30.dataReady()) {
             if (millis() - waitStart > 5000) {
@@ -1046,7 +1240,8 @@ void loop() {
             if (co2 <= 0.0f) {
                 Serial.println("Ignoring invalid CO2 reading (0 ppm)");
             } else {
-                Serial.printf("CO2: %.0f ppm | Temp: %.1f F | RH: %.1f %%\n", co2, tempF, rh);
+                Serial.printf("CO2: %.0f ppm | Temp: %.1f F | RH: %.1f %% | Batt: %.2fV (%u%%)\n",
+                               co2, tempF, rh, battV, battPct);
 
                 portENTER_CRITICAL(&stateMux);
                 displayUpdateInProgress = true;
@@ -1083,12 +1278,6 @@ void loop() {
             Serial.println("Failed to read SCD-30");
         }
 
-        if (!sampled) {
-            applyPendingInvertToggleIfAny();
-            applyPendingModeCycleIfAny();
-            applyPendingCarouselToggleIfAny();
-        }
-
         enterDeepSleepMs(sleepPollMs);
         return;
     }
@@ -1119,8 +1308,12 @@ void loop() {
             if (co2 <= 0.0f) {
                 Serial.println("Ignoring invalid CO2 reading (0 ppm)");
             } else {
-                Serial.printf("CO2: %.0f ppm | Temp: %.1f F | RH: %.1f %%\n",
-                               co2, tempF, rh);
+                {
+                    float uBattV = readBatteryVoltage();
+                    uint8_t uBattPct = batteryPercentFromVoltage(uBattV);
+                    Serial.printf("CO2: %.0f ppm | Temp: %.1f F | RH: %.1f %% | Batt: %.2fV (%u%%)\n",
+                                   co2, tempF, rh, uBattV, uBattPct);
+                }
 
                 portENTER_CRITICAL(&stateMux);
                 displayUpdateInProgress = true;
