@@ -404,9 +404,78 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
     esp_deep_sleep_start();
 }
 
-// Forward declaration for toggle redraw logic
+// Forward declarations
 void updateDisplay(float co2, float tempF, float rh);
 static void flashNeopixelsColor(uint8_t red, uint8_t green, uint8_t blue, uint16_t ms);
+static void advanceDisplayMode();
+static const char *displayModeName(uint8_t mode);
+
+// ---------------------------------------------------------------------------
+// Battery-mode helper: handle a button press by GPIO number.
+// Applies the action (mode/carousel/invert) and redraws if we have a reading.
+// ---------------------------------------------------------------------------
+static void applyButtonAction(uint8_t gpio) {
+    if (gpio == MODE_BTN) {
+        advanceDisplayMode();
+        Serial.printf("Button → mode: %s\n", displayModeName(currentDisplayMode));
+        playModeToggleTone();
+    } else if (gpio == CAROUSEL_BTN) {
+        carouselModeEnabled = !carouselModeEnabled;
+        Serial.printf("Button → carousel: %s\n", carouselModeEnabled ? "ON" : "OFF");
+        if (carouselModeEnabled) {
+            flashNeopixelsColor(140, 0, 110, INVERT_FLASH_MS);
+        } else {
+            flashNeopixelsColor(255, 0, 0, INVERT_FLASH_MS);
+        }
+        playModeToggleTone();
+    } else if (gpio == INVERT_BTN) {
+        inverted = !inverted;
+        saveVisualPreferences();
+        Serial.printf("Button → invert: %s\n", inverted ? "ON" : "OFF");
+        flashNeopixelsColor(24, 24, 24, INVERT_FLASH_MS);
+        playInvertToggleTone();
+    } else {
+        return;
+    }
+
+    if (hasReading) {
+        updateDisplay(lastCO2, lastTempF, lastRH);
+        lastDisplayMs = millis();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Battery-mode helper: delay for `waitMs` while polling buttons every ~50 ms.
+// Detects new presses (edge-triggered) and immediately processes them.
+// ---------------------------------------------------------------------------
+static void delayWithButtonPolling(uint32_t waitMs) {
+    const uint8_t btnPins[] = { MODE_BTN, CAROUSEL_BTN, INVERT_BTN };
+    const int btnCount = sizeof(btnPins) / sizeof(btnPins[0]);
+    bool prevState[3] = { false, false, false };
+
+    // Seed previous state so already-held buttons don't re-trigger
+    for (int i = 0; i < btnCount; i++) {
+        prevState[i] = (digitalRead(btnPins[i]) == LOW);
+    }
+
+    unsigned long start = millis();
+    while (millis() - start < waitMs) {
+        for (int i = 0; i < btnCount; i++) {
+            bool pressed = (digitalRead(btnPins[i]) == LOW);
+            if (pressed && !prevState[i]) {
+                // New press detected — debounce briefly then act
+                delay(40);
+                if (digitalRead(btnPins[i]) == LOW) {
+                    applyButtonAction(btnPins[i]);
+                    // Wait for release to avoid repeat-fire
+                    while (digitalRead(btnPins[i]) == LOW) delay(20);
+                }
+            }
+            prevState[i] = pressed;
+        }
+        delay(50);
+    }
+}
 
 static const char *displayModeName(uint8_t mode) {
     switch (mode) {
@@ -1151,9 +1220,10 @@ void setup() {
 
         // After deep sleep the sensor was fully off; it needs ~25 s of
         // continuous measurement before the readings are accurate.
+        // Poll buttons during warm-up so the UI stays responsive.
         if (!usbPowerPresent && wokeFromDeepSleep) {
-            Serial.printf("SCD30 warm-up: %d ms\n", SCD30_WARMUP_MS);
-            delay(SCD30_WARMUP_MS);
+            Serial.printf("SCD30 warm-up: %d ms (buttons active)\n", SCD30_WARMUP_MS);
+            delayWithButtonPolling(SCD30_WARMUP_MS);
         }
     } else {
         Serial.println("SCD30 skipped (poll-only wake)");
@@ -1185,32 +1255,7 @@ void loop() {
 
         // Handle button wake: apply the pressed button's action
         if (buttonWakeGPIO != 0) {
-            if (buttonWakeGPIO == MODE_BTN) {
-                advanceDisplayMode();
-                Serial.printf("Button wake → mode: %s\n", displayModeName(currentDisplayMode));
-                playModeToggleTone();
-            } else if (buttonWakeGPIO == CAROUSEL_BTN) {
-                carouselModeEnabled = !carouselModeEnabled;
-                Serial.printf("Button wake → carousel: %s\n", carouselModeEnabled ? "ON" : "OFF");
-                if (carouselModeEnabled) {
-                    flashNeopixelsColor(140, 0, 110, INVERT_FLASH_MS);
-                } else {
-                    flashNeopixelsColor(255, 0, 0, INVERT_FLASH_MS);
-                }
-                playModeToggleTone();
-            } else if (buttonWakeGPIO == INVERT_BTN) {
-                inverted = !inverted;
-                saveVisualPreferences();
-                Serial.printf("Button wake → invert: %s\n", inverted ? "ON" : "OFF");
-                flashNeopixelsColor(24, 24, 24, INVERT_FLASH_MS);
-                playInvertToggleTone();
-            }
-
-            // Force display update with last known readings
-            if (hasReading) {
-                updateDisplay(lastCO2, lastTempF, lastRH);
-                lastDisplayMs = millis();
-            }
+            applyButtonAction(buttonWakeGPIO);
             buttonWakeGPIO = 0;
         }
 
@@ -1254,6 +1299,16 @@ void loop() {
             if (millis() - waitStart > 5000) {
                 Serial.println("Timeout waiting for SCD-30 data");
                 break;
+            }
+            // Poll buttons while waiting for sensor data
+            for (uint8_t pin : {MODE_BTN, CAROUSEL_BTN, INVERT_BTN}) {
+                if (digitalRead(pin) == LOW) {
+                    delay(40);
+                    if (digitalRead(pin) == LOW) {
+                        applyButtonAction(pin);
+                        while (digitalRead(pin) == LOW) delay(20);
+                    }
+                }
             }
             delay(50);
         }
