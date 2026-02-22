@@ -7,6 +7,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <USB.h>
+#include <esp_sleep.h>
 
 // ---------------------------------------------------------------------------
 // Timing
@@ -23,6 +24,11 @@
 #define BATTERY_SAMPLE_INTERVAL_MS  60000
 #define BATTERY_DISPLAY_INTERVAL_MS 300000
 #define POWER_CHECK_INTERVAL_MS      5000
+#define USB_SAMPLE_FLASH_R             80
+#define USB_SAMPLE_FLASH_G              0
+#define USB_SAMPLE_FLASH_B            120
+
+#define BATTERY_DISPLAY_EVERY_N ((BATTERY_DISPLAY_INTERVAL_MS / BATTERY_SAMPLE_INTERVAL_MS) > 0 ? (BATTERY_DISPLAY_INTERVAL_MS / BATTERY_SAMPLE_INTERVAL_MS) : 1)
 
 // ---------------------------------------------------------------------------
 // History ring buffer  (30 min @ 20 s/sample = 90 samples)
@@ -87,6 +93,8 @@ static float batteryVoltageFiltered = 0.0f;
 static unsigned long lastPowerCheckMs = 0;
 static int usbHeuristicScore = 0;
 static bool usbByHeuristic = false;
+RTC_DATA_ATTR static uint32_t batterySampleCycles = 0;
+static bool wokeFromDeepSleep = false;
 
 static uint16_t fgColor() { return inverted ? EPD_WHITE : EPD_BLACK; }
 static uint16_t bgColor() { return inverted ? EPD_BLACK : EPD_WHITE; }
@@ -206,6 +214,24 @@ static uint32_t currentSampleIntervalMs() {
 
 static uint32_t currentDisplayIntervalMs() {
     return usbPowerPresent ? USB_DISPLAY_INTERVAL_MS : BATTERY_DISPLAY_INTERVAL_MS;
+}
+
+static void flashNeopixelsColor(uint8_t red, uint8_t green, uint8_t blue, uint16_t ms);
+
+static void flashSampleIndicator() {
+    if (usbPowerPresent) {
+        flashNeopixelsColor(USB_SAMPLE_FLASH_R, USB_SAMPLE_FLASH_G, USB_SAMPLE_FLASH_B, FLASH_DURATION_MS);
+    }
+}
+
+static void enterDeepSleepMs(uint32_t sleepMs) {
+    digitalWrite(NEOPIXEL_POWER, HIGH);
+    digitalWrite(SPEAKER_SHUTDOWN, LOW);
+
+    Serial.printf("Battery mode deep sleep for %lu ms\n", (unsigned long)sleepMs);
+    Serial.flush();
+    esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
+    esp_deep_sleep_start();
 }
 
 // Forward declaration for toggle redraw logic
@@ -557,6 +583,7 @@ void setup() {
     Serial.begin(115200);
     delay(2000);
     Serial.println("MagTag CO2 Monitor starting...");
+    wokeFromDeepSleep = (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED);
 
     // ── Neopixels ──
     pinMode(NEOPIXEL_POWER, OUTPUT);
@@ -565,12 +592,16 @@ void setup() {
     pixels.setBrightness(50);
     pixels.clear();
     pixels.show();
-    flashNeopixelsColor(0, 180, 0, STARTUP_FLASH_MS);
+    if (!wokeFromDeepSleep) {
+        flashNeopixelsColor(0, 180, 0, STARTUP_FLASH_MS);
+    }
 
     // ── Speaker ──
     pinMode(SPEAKER_SHUTDOWN, OUTPUT);
     digitalWrite(SPEAKER_SHUTDOWN, LOW);
-    playStartupJingle();
+    if (!wokeFromDeepSleep) {
+        playStartupJingle();
+    }
 
     // ── Battery monitor ADC setup ──
     analogReadResolution(12);
@@ -590,8 +621,10 @@ void setup() {
 
     // ── E-ink display ──
     display.begin(THINKINK_MONO);
-    showStatus("Started");
-    Serial.println("Display: Started");
+    if (!wokeFromDeepSleep) {
+        showStatus("Started");
+        Serial.println("Display: Started");
+    }
 
 #if CONFIG_TINYUSB_ENABLED
     USB.begin();
@@ -606,7 +639,9 @@ void setup() {
     // ── D11 long-press listener task (runs continuously) ──
     xTaskCreate(layoutButtonTask, "layout_btn", 4096, nullptr, 1, nullptr);
 
-    delay(5000);
+    if (!wokeFromDeepSleep) {
+        delay(5000);
+    }
 
     // ── I2C + SCD-30 sensor ──
     Wire.begin(SDA, SCL);
@@ -638,6 +673,69 @@ void loop() {
             flashNeopixelsColor(220, 90, 0, 180);    // USB disconnected: orange
             playUsbDisconnectedJingle();
         }
+    }
+
+    if (!usbPowerPresent) {
+        bool sampled = false;
+
+        unsigned long waitStart = millis();
+        while (!scd30.dataReady()) {
+            if (millis() - waitStart > 5000) {
+                Serial.println("Timeout waiting for SCD-30 data");
+                break;
+            }
+            delay(50);
+        }
+
+        if (scd30.read()) {
+            float co2   = scd30.CO2;
+            float tempC = scd30.temperature;
+            float tempF = tempC * 9.0f / 5.0f + 32.0f;
+            float rh    = scd30.relative_humidity;
+
+            if (co2 <= 0.0f) {
+                Serial.println("Ignoring invalid CO2 reading (0 ppm)");
+            } else {
+                Serial.printf("CO2: %.0f ppm | Temp: %.1f F | RH: %.1f %%\n", co2, tempF, rh);
+
+                portENTER_CRITICAL(&stateMux);
+                displayUpdateInProgress = true;
+                portEXIT_CRITICAL(&stateMux);
+
+                pushSample(co2, tempF, rh);
+                bool firstBatteryDisplay = (batterySampleCycles == 0);
+                batterySampleCycles++;
+                bool periodicDisplay = ((batterySampleCycles % BATTERY_DISPLAY_EVERY_N) == 0);
+
+                lastCO2 = co2;
+                lastTempF = tempF;
+                lastRH = rh;
+                hasReading = true;
+
+                if (firstBatteryDisplay || periodicDisplay) {
+                    updateDisplay(co2, tempF, rh);
+                    lastDisplayMs = millis();
+                }
+
+                portENTER_CRITICAL(&stateMux);
+                displayUpdateInProgress = false;
+                portEXIT_CRITICAL(&stateMux);
+
+                applyPendingInvertToggleIfAny();
+                applyPendingLayoutToggleIfAny();
+                sampled = true;
+            }
+        } else {
+            Serial.println("Failed to read SCD-30");
+        }
+
+        if (!sampled) {
+            applyPendingInvertToggleIfAny();
+            applyPendingLayoutToggleIfAny();
+        }
+
+        enterDeepSleepMs(BATTERY_SAMPLE_INTERVAL_MS);
+        return;
     }
 
     uint32_t sampleIntervalMs = currentSampleIntervalMs();
@@ -677,7 +775,7 @@ void loop() {
                 bool firstDisplay = !hasReading;
                 lastCO2 = co2; lastTempF = tempF; lastRH = rh;
                 hasReading = true;
-                flashNeopixelsRed();
+                flashSampleIndicator();
 
                 bool shouldDisplay = firstDisplay || (millis() - lastDisplayMs >= displayIntervalMs);
                 if (shouldDisplay) {
