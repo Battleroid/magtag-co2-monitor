@@ -9,7 +9,6 @@
 #include <USB.h>
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
-#include <Preferences.h>
 #include <WiFi.h>
 #ifdef CONFIG_BT_ENABLED
 #include <esp_bt.h>
@@ -71,10 +70,8 @@
 // ---------------------------------------------------------------------------
 // UI input mapping (which button controls what)
 // ---------------------------------------------------------------------------
-#define INVERT_BTN                       15    // D15: toggle black/white inversion.
 #define MODE_BTN                         12    // D12: cycle display mode.
 #define CAROUSEL_BTN                     14    // D14: toggle carousel mode.
-#define LONG_PRESS_MS                  2000    // Long-press threshold for button actions.
 
 // ---------------------------------------------------------------------------
 // NeoPixel feedback colors (what each event looks like)
@@ -94,10 +91,6 @@
 #define USB_DISCONNECTED_FLASH_R        220
 #define USB_DISCONNECTED_FLASH_G         90
 #define USB_DISCONNECTED_FLASH_B          0
-
-#define INVERT_TOGGLE_FLASH_R            24
-#define INVERT_TOGGLE_FLASH_G            24
-#define INVERT_TOGGLE_FLASH_B            24
 
 #define MODE_TOGGLE_FLASH_R              24
 #define MODE_TOGGLE_FLASH_G              24
@@ -169,12 +162,6 @@
 #define SCD30_WARMUP_MS               25000   // Cold-start warm-up before trusting readings.
 
 // ---------------------------------------------------------------------------
-// Preferences storage keys
-// ---------------------------------------------------------------------------
-#define PREFS_NAMESPACE "magco2"        // NVS namespace for persisted UI settings.
-#define PREF_KEY_INVERT "invert"        // Persisted inversion toggle.
-
-// ---------------------------------------------------------------------------
 // History ring buffer  (30 min @ 20 s/sample = 90 samples)
 // ---------------------------------------------------------------------------
 #define HISTORY_LEN 90
@@ -210,10 +197,6 @@ static unsigned long histGetTs(int i) {
     return histTs[idx];
 }
 
-// ---------------------------------------------------------------------------
-// Display colour-scheme toggle  (D15 long-press)
-// ---------------------------------------------------------------------------
-static bool     inverted       = false;
 static bool     graphHeavyLayout = true;
 
 enum DisplayMode : uint8_t {
@@ -228,13 +211,12 @@ enum DisplayMode : uint8_t {
 static uint8_t currentDisplayMode = DISPLAY_MODE_COMBINED;
 static bool carouselModeEnabled = false;
 
-// Last displayed values (for immediate redraw on invert toggle)
+// Last displayed values (for immediate redraw on button toggles)
 static float lastCO2   = 0;
 static float lastTempF = 0;
 static float lastRH    = 0;
 static bool  hasReading = false;
 static bool  displayUpdateInProgress = false;
-static bool  invertTogglePending = false;
 static bool  modeCyclePending = false;
 static bool  carouselTogglePending = false;
 static portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
@@ -265,7 +247,6 @@ RTC_DATA_ATTR static bool rtcNotified2to1 = false;
 // RTC-persisted state (survives deep sleep)
 RTC_DATA_ATTR static uint8_t  rtcDisplayMode       = DISPLAY_MODE_COMBINED;
 RTC_DATA_ATTR static bool     rtcCarouselEnabled    = false;
-RTC_DATA_ATTR static bool     rtcInverted           = false;
 RTC_DATA_ATTR static float    rtcLastCO2            = 0;
 RTC_DATA_ATTR static float    rtcLastTempF          = 0;
 RTC_DATA_ATTR static float    rtcLastRH             = 0;
@@ -274,11 +255,9 @@ RTC_DATA_ATTR static bool     rtcHasReading         = false;
 static bool wokeFromDeepSleep = false;
 static uint8_t buttonWakeGPIO = 0;   // which button GPIO caused wake (0 = none)
 static bool scd30Ready = false;      // whether SCD30 was initialized this wake cycle
-static Preferences prefs;
-static bool prefsReady = false;
 
-static uint16_t fgColor() { return inverted ? EPD_WHITE : EPD_BLACK; }
-static uint16_t bgColor() { return inverted ? EPD_BLACK : EPD_WHITE; }
+static uint16_t fgColor() { return EPD_BLACK; }
+static uint16_t bgColor() { return EPD_WHITE; }
 
 static float readBatteryVoltage() {
     int raw = analogRead(BATT_MONITOR);
@@ -304,15 +283,8 @@ static bool stopScd30Measurements() {
 }
 
 static void loadVisualPreferences() {
-    if (!prefsReady) return;
-    inverted = prefs.getBool(PREF_KEY_INVERT, false);
     graphHeavyLayout = true;
-    Serial.printf("Loaded prefs: invert=%s layout=GRAPH_HEAVY\n", inverted ? "ON" : "OFF");
-}
-
-static void saveVisualPreferences() {
-    if (!prefsReady) return;
-    prefs.putBool(PREF_KEY_INVERT, inverted);
+    Serial.println("Loaded prefs: layout=GRAPH_HEAVY");
 }
 
 static void adjustUsbHeuristicScore(float dv) {
@@ -368,10 +340,6 @@ static void playStartupJingle() {
     playToneOnce(1175, 110);
     delay(20);
     playToneOnce(1568, 170);
-}
-
-static void playInvertToggleTone() {
-    playToneOnce(1318, 80);
 }
 
 static void playLayoutToggleTone() {
@@ -649,7 +617,6 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
     // Persist state to RTC memory before sleeping
     rtcDisplayMode    = currentDisplayMode;
     rtcCarouselEnabled = carouselModeEnabled;
-    rtcInverted       = inverted;
     rtcLastCO2        = lastCO2;
     rtcLastTempF      = lastTempF;
     rtcLastRH         = lastRH;
@@ -685,8 +652,8 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
     // Timer wake for periodic sampling
     esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
 
-    // Button wake: D15 (invert), D14 (carousel), D12 (mode) — active-low
-    uint64_t buttonMask = (1ULL << INVERT_BTN) | (1ULL << CAROUSEL_BTN) | (1ULL << MODE_BTN);
+    // Button wake: D14 (carousel), D12 (mode) — active-low
+    uint64_t buttonMask = (1ULL << CAROUSEL_BTN) | (1ULL << MODE_BTN);
     esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ANY_LOW);
 
     // Keep RTC peripherals powered so internal pull-ups stay active
@@ -694,7 +661,7 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
 
     // Explicitly enable RTC-domain pull-ups on button GPIOs to prevent
     // floating inputs from triggering spurious ext1 wakes during sleep.
-    const gpio_num_t btnPins[] = { (gpio_num_t)INVERT_BTN, (gpio_num_t)CAROUSEL_BTN, (gpio_num_t)MODE_BTN };
+    const gpio_num_t btnPins[] = { (gpio_num_t)CAROUSEL_BTN, (gpio_num_t)MODE_BTN };
     for (auto pin : btnPins) {
         rtc_gpio_init(pin);
         rtc_gpio_set_direction(pin, RTC_GPIO_MODE_INPUT_ONLY);
@@ -717,7 +684,7 @@ static const char *displayModeName(uint8_t mode);
 
 // ---------------------------------------------------------------------------
 // Battery-mode helper: handle a button press by GPIO number.
-// Applies the action (mode/carousel/invert) and redraws if we have a reading.
+// Applies the action (mode/carousel) and redraws if we have a reading.
 // ---------------------------------------------------------------------------
 static void applyButtonAction(uint8_t gpio) {
     if (gpio == MODE_BTN) {
@@ -733,12 +700,6 @@ static void applyButtonAction(uint8_t gpio) {
             flashNeopixelsColor(CAROUSEL_OFF_FLASH_R, CAROUSEL_OFF_FLASH_G, CAROUSEL_OFF_FLASH_B, INVERT_FLASH_MS);
         }
         playModeToggleTone();
-    } else if (gpio == INVERT_BTN) {
-        inverted = !inverted;
-        saveVisualPreferences();
-        Serial.printf("Button → invert: %s\n", inverted ? "ON" : "OFF");
-        flashNeopixelsColor(INVERT_TOGGLE_FLASH_R, INVERT_TOGGLE_FLASH_G, INVERT_TOGGLE_FLASH_B, INVERT_FLASH_MS);
-        playInvertToggleTone();
     } else {
         return;
     }
@@ -754,9 +715,9 @@ static void applyButtonAction(uint8_t gpio) {
 // Detects new presses (edge-triggered) and immediately processes them.
 // ---------------------------------------------------------------------------
 static void delayWithButtonPolling(uint32_t waitMs) {
-    const uint8_t btnPins[] = { MODE_BTN, CAROUSEL_BTN, INVERT_BTN };
+    const uint8_t btnPins[] = { MODE_BTN, CAROUSEL_BTN };
     const int btnCount = sizeof(btnPins) / sizeof(btnPins[0]);
-    bool prevState[3] = { false, false, false };
+    bool prevState[2] = { false, false };
 
     // Seed previous state so already-held buttons don't re-trigger
     for (int i = 0; i < btnCount; i++) {
@@ -796,61 +757,6 @@ static const char *displayModeName(uint8_t mode) {
 static void advanceDisplayMode() {
     currentDisplayMode = (uint8_t)((currentDisplayMode + 1) % DISPLAY_MODE_COUNT);
 }
-
-static void handleInvertToggleRequest() {
-    bool canApplyNow;
-
-    portENTER_CRITICAL(&stateMux);
-    canApplyNow = !displayUpdateInProgress;
-    if (!canApplyNow) {
-        invertTogglePending = true;
-        portEXIT_CRITICAL(&stateMux);
-        return;
-    }
-    displayUpdateInProgress = true;
-    portEXIT_CRITICAL(&stateMux);
-
-    inverted = !inverted;
-    saveVisualPreferences();
-    Serial.printf("Display inverted: %s\n", inverted ? "ON" : "OFF");
-    flashNeopixelsColor(INVERT_TOGGLE_FLASH_R, INVERT_TOGGLE_FLASH_G, INVERT_TOGGLE_FLASH_B, INVERT_FLASH_MS);
-    playInvertToggleTone();
-
-    if (hasReading) {
-        updateDisplay(lastCO2, lastTempF, lastRH);
-    }
-
-    portENTER_CRITICAL(&stateMux);
-    displayUpdateInProgress = false;
-    portEXIT_CRITICAL(&stateMux);
-}
-
-static void applyPendingInvertToggleIfAny() {
-    bool shouldApply = false;
-    portENTER_CRITICAL(&stateMux);
-    if (invertTogglePending && !displayUpdateInProgress) {
-        invertTogglePending = false;
-        displayUpdateInProgress = true;
-        shouldApply = true;
-    }
-    portEXIT_CRITICAL(&stateMux);
-
-    if (!shouldApply) return;
-
-    inverted = !inverted;
-    saveVisualPreferences();
-    Serial.printf("Display inverted (deferred): %s\n", inverted ? "ON" : "OFF");
-    flashNeopixelsColor(INVERT_TOGGLE_FLASH_R, INVERT_TOGGLE_FLASH_G, INVERT_TOGGLE_FLASH_B, INVERT_FLASH_MS);
-    playInvertToggleTone();
-    if (hasReading) {
-        updateDisplay(lastCO2, lastTempF, lastRH);
-    }
-
-    portENTER_CRITICAL(&stateMux);
-    displayUpdateInProgress = false;
-    portEXIT_CRITICAL(&stateMux);
-}
-
 
 static void handleModeCycleRequest() {
     bool canApplyNow;
@@ -965,35 +871,6 @@ static void applyPendingCarouselToggleIfAny() {
     displayUpdateInProgress = false;
     portEXIT_CRITICAL(&stateMux);
 }
-
-static void invertButtonTask(void *param) {
-    (void)param;
-    bool pressedPrev = false;
-    bool longPressFired = false;
-    unsigned long downAt = 0;
-
-    while (true) {
-        bool pressed = (digitalRead(INVERT_BTN) == LOW);
-
-        if (pressed && !pressedPrev) {
-            downAt = millis();
-            longPressFired = false;
-        }
-
-        if (pressed && !longPressFired && (millis() - downAt >= LONG_PRESS_MS)) {
-            longPressFired = true;
-            handleInvertToggleRequest();
-        }
-
-        if (!pressed) {
-            longPressFired = false;
-        }
-
-        pressedPrev = pressed;
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-}
-
 
 static void modeButtonTask(void *param) {
     (void)param;
@@ -1226,7 +1103,6 @@ void updateDisplay(float co2, float tempF, float rh) {
     if (contentW < 32 || contentH < 32) return;
 
     display.clearBuffer();
-    if (inverted) display.fillScreen(EPD_BLACK);
     display.setTextColor(fg);
 
     char buf[32];
@@ -1371,7 +1247,6 @@ void updateDisplay(float co2, float tempF, float rh) {
 void showStatus(const char *msg) {
     display.clearBuffer();
     display.setTextColor(fgColor());
-    if (inverted) display.fillScreen(EPD_BLACK);
     display.setTextSize(2);
     int16_t x1, y1;
     uint16_t w, h;
@@ -1388,7 +1263,6 @@ void showStatus(const char *msg) {
 void showStartupImage() {
 #if HAS_STARTUP_IMAGE
     display.clearBuffer();
-    if (inverted) display.fillScreen(EPD_BLACK);
     display.drawBitmap(0, 0, STARTUP_IMAGE_BITMAP, STARTUP_IMAGE_WIDTH, STARTUP_IMAGE_HEIGHT, fgColor());
     display.display();
 #else
@@ -1407,7 +1281,6 @@ void setup() {
     wokeFromDeepSleep = (wakeCause != ESP_SLEEP_WAKEUP_UNDEFINED);
 
     // Configure button GPIOs and sample state immediately
-    pinMode(INVERT_BTN, INPUT_PULLUP);
     pinMode(MODE_BTN, INPUT_PULLUP);
     pinMode(CAROUSEL_BTN, INPUT_PULLUP);
 
@@ -1420,7 +1293,6 @@ void setup() {
         uint64_t wakeStatus = esp_sleep_get_ext1_wakeup_status();
         if (wakeStatus & (1ULL << MODE_BTN))        buttonWakeGPIO = MODE_BTN;
         else if (wakeStatus & (1ULL << CAROUSEL_BTN)) buttonWakeGPIO = CAROUSEL_BTN;
-        else if (wakeStatus & (1ULL << INVERT_BTN))   buttonWakeGPIO = INVERT_BTN;
 
         // Immediate pin check — no delay, just verify the button is actually held
         if (buttonWakeGPIO != 0 && digitalRead(buttonWakeGPIO) != LOW) {
@@ -1432,7 +1304,6 @@ void setup() {
     if (wokeFromDeepSleep) {
         currentDisplayMode  = rtcDisplayMode;
         carouselModeEnabled = rtcCarouselEnabled;
-        inverted            = rtcInverted;
         lastCO2             = rtcLastCO2;
         lastTempF           = rtcLastTempF;
         lastRH              = rtcLastRH;
@@ -1452,12 +1323,7 @@ void setup() {
     }
     Serial.println("MagTag CO2 Monitor starting...");
 
-    prefsReady = prefs.begin(PREFS_NAMESPACE, false);
-    if (!prefsReady) {
-        Serial.println("WARNING: failed to open preferences namespace");
-    }
-    // On cold boot, load visual prefs from NVS.
-    // On deep sleep wake, RTC memory already has the correct state.
+    // Load visual defaults.
     if (!wokeFromDeepSleep) {
         loadVisualPreferences();
     }
@@ -1551,7 +1417,6 @@ void setup() {
     // Button polling tasks are only useful in USB mode where we stay awake.
     // In battery mode, buttons wake the device via ext1 interrupt instead.
     if (usbPowerPresent) {
-        xTaskCreate(invertButtonTask, "invert_btn", 8192, nullptr, 1, nullptr);
         xTaskCreate(modeButtonTask, "mode_btn", 8192, nullptr, 1, nullptr);
         xTaskCreate(carouselButtonTask, "carousel_btn", 8192, nullptr, 1, nullptr);
     }
@@ -1591,7 +1456,6 @@ void setup() {
 
 // ---------------------------------------------------------------------------
 // Main loop – read → flash → display → sleep, every 20 s.
-//   D15 invert is handled by a dedicated FreeRTOS task.
 // ---------------------------------------------------------------------------
 void loop() {
     unsigned long now = millis();
@@ -1689,7 +1553,7 @@ void loop() {
                 break;
             }
             // Poll buttons while waiting for sensor data
-            for (uint8_t pin : {MODE_BTN, CAROUSEL_BTN, INVERT_BTN}) {
+            for (uint8_t pin : {MODE_BTN, CAROUSEL_BTN}) {
                 if (digitalRead(pin) == LOW) {
                     delay(40);
                     if (digitalRead(pin) == LOW) {
@@ -1739,7 +1603,6 @@ void loop() {
                 displayUpdateInProgress = false;
                 portEXIT_CRITICAL(&stateMux);
 
-                applyPendingInvertToggleIfAny();
                 applyPendingModeCycleIfAny();
                 applyPendingCarouselToggleIfAny();
                 sampled = true;
@@ -1809,7 +1672,6 @@ void loop() {
                 displayUpdateInProgress = false;
                 portEXIT_CRITICAL(&stateMux);
 
-                applyPendingInvertToggleIfAny();
                 applyPendingModeCycleIfAny();
                 applyPendingCarouselToggleIfAny();
             }
@@ -1818,7 +1680,6 @@ void loop() {
         }
     }
 
-    applyPendingInvertToggleIfAny();
     applyPendingModeCycleIfAny();
     applyPendingCarouselToggleIfAny();
 

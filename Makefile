@@ -1,7 +1,7 @@
 .PHONY: build upload monitor clean all install image images
 
-PLATFORMIO := platformio
-PYTHON := python3
+PLATFORMIO := $(if $(wildcard .venv/bin/pio),.venv/bin/pio,platformio)
+PYTHON := $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 IMAGE_WIDTH := 296
 IMAGE_HEIGHT := 128
 
