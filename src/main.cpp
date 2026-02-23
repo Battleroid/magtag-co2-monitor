@@ -21,6 +21,22 @@
 #define HAS_STARTUP_IMAGE 0
 #endif
 
+#ifndef BUILD_VERSION_STR
+#define BUILD_VERSION_STR "dev"
+#endif
+
+#ifndef BUILD_HASH_STR
+#define BUILD_HASH_STR "unknown"
+#endif
+
+#ifndef BUILD_EPOCH_UNIX
+#define BUILD_EPOCH_UNIX 0UL
+#endif
+
+#ifndef BUILD_DIRTY_STR
+#define BUILD_DIRTY_STR "unknown"
+#endif
+
 // ---------------------------------------------------------------------------
 // Timing and scheduling (what runs when)
 // ---------------------------------------------------------------------------
@@ -34,6 +50,7 @@
 #define FLASH_DURATION_MS                 500   // Standard NeoPixel flash duration.
 #define STARTUP_FLASH_MS                  220   // Startup flash duration.
 #define INVERT_FLASH_MS                   150   // UI toggle feedback flash duration.
+#define STARTUP_BUILD_INFO_MS            5000   // How long to show build metadata after startup image.
 
 #define GRAPH_WINDOW_MINUTES               15   // Time span shown on graphs.
 
@@ -1272,6 +1289,43 @@ void showStartupImage() {
 #endif
 }
 
+static void showBuildInfoScreen() {
+    char lineVersion[32];
+    char lineHash[40];
+    char lineEpoch[40];
+    char lineState[40];
+
+    snprintf(lineVersion, sizeof(lineVersion), "Build: %s", BUILD_VERSION_STR);
+    snprintf(lineHash, sizeof(lineHash), "Hash: %s", BUILD_HASH_STR);
+    snprintf(lineEpoch, sizeof(lineEpoch), "Epoch: %lu", (unsigned long)BUILD_EPOCH_UNIX);
+    snprintf(lineState, sizeof(lineState), "State: %s", BUILD_DIRTY_STR);
+
+    display.clearBuffer();
+    display.fillScreen(bgColor());
+    display.setTextColor(fgColor());
+    display.setTextWrap(false);
+
+    const int16_t baseX = SCREEN_PAD_LEFT + 8;
+    const int16_t baseY = SCREEN_PAD_TOP;
+
+    display.setTextSize(2);
+    display.setCursor(baseX, baseY + 16);
+    display.print("Build Info");
+
+    display.setTextSize(1);
+    display.setCursor(baseX, baseY + 52);
+    display.print(lineVersion);
+    display.setCursor(baseX, baseY + 72);
+    display.print(lineHash);
+    display.setCursor(baseX, baseY + 92);
+    display.print(lineEpoch);
+    display.setCursor(baseX, baseY + 112);
+    display.print(lineState);
+    display.display();
+
+    delay(STARTUP_BUILD_INFO_MS);
+}
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -1367,6 +1421,7 @@ void setup() {
     if (!wokeFromDeepSleep) {
         showStartupImage();
         Serial.println("Display: Startup image");
+        showBuildInfoScreen();
     }
 
 #if CONFIG_TINYUSB_ENABLED

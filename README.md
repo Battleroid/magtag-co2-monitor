@@ -46,6 +46,26 @@ Then log out and back in.
 - Clean build artifacts: `make clean`
 - Full clean (`.pio`): `make distclean`
 - Convert all images in `assets/images/`: `make images`
+- Install local git hooks: `make hooks`
+
+## Pre-commit and CI workflow
+
+This repo includes automated checks and release metadata updates:
+
+- Local pre-commit hook: runs `make build` before every commit to catch regressions early.
+- PR CI (`.github/workflows/pr-checks.yml`): builds firmware on pull requests targeting `master`/`main`.
+- Post-merge CI (`.github/workflows/post-merge-release.yml`): on push to `master`/`main`, updates:
+   - `BUILD_VERSION` to the current commit count (`git rev-list --count HEAD`), and
+   - `CHANGELOG.md` by adding a `## v<build> - <date>` section with per-commit bullets and GitHub commit-hash links,
+   - creates a GitHub Release `v<build>` using that changelog section as release notes,
+   - then commits metadata changes automatically.
+
+To enable local hooks after cloning/setup:
+
+```bash
+source .venv/bin/activate
+make hooks
+```
 
 ## Customizable options
 
@@ -225,3 +245,5 @@ Because of this, power mode can occasionally be misclassified for short periods,
 
 - The project now uses fixed black-on-white display rendering (inversion mode removed).
 - The Makefile prefers local `.venv` tools automatically when available.
+- Build number shown on device is the current repository commit count at build time (`git rev-list --count HEAD`).
+- On cold boot, after the startup image, the display shows build metadata for ~5 seconds: build version, git hash, build epoch, and working-tree state (`CLEAN` or `IN_PROGRESS`).
