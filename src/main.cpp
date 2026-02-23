@@ -24,7 +24,6 @@
 // ---------------------------------------------------------------------------
 // Timing and scheduling (what runs when)
 // ---------------------------------------------------------------------------
-#define CYCLE_INTERVAL_MS               20000   // Main loop cadence: 20 s between measurement cycles.
 #define USB_SAMPLE_INTERVAL_MS          15000   // Faster sampling while externally powered.
 #define USB_DISPLAY_INTERVAL_MS         30000   // More frequent display updates while on USB.
 #define BATTERY_SAMPLE_INTERVAL_MS      60000   // Slower sampling to conserve battery.
@@ -49,16 +48,13 @@
 // Combined view layout presets on 296x128 panel.
 #define TEXT_RIGHT_BALANCED             140    // Right edge of value text in balanced layout.
 #define GRAPH_X_BALANCED                152    // Graphs start X in balanced layout.
-#define GRAPH_W_BALANCED                136    // Graph width in balanced layout.
 
 #define TEXT_RIGHT_GRAPH_HEAVY          108    // Right edge of value text in graph-heavy layout.
 #define GRAPH_X_GRAPH_HEAVY             120    // Graphs start X in graph-heavy layout.
-#define GRAPH_W_GRAPH_HEAVY             168    // Graph width in graph-heavy layout.
 
 #define GRAPH_H_CO2                      40    // CO2 graph height (emphasized metric).
 #define GRAPH_H_STD                      30    // Temp/RH graph height.
 #define GRAPH_GAP                         6    // Vertical spacing between stacked graphs.
-#define GRAPH_Y0                          8    // Legacy top offset reference for stacked graphs.
 
 // Screen-edge content padding for enclosure/bezel compensation.
 #define SCREEN_PAD_LEFT                   0
@@ -87,10 +83,6 @@
 #define USB_CONNECTED_FLASH_G             0
 #define USB_CONNECTED_FLASH_B           200
 
-#define USB_DISCONNECTED_FLASH_R        220
-#define USB_DISCONNECTED_FLASH_G         90
-#define USB_DISCONNECTED_FLASH_B          0
-
 #define MODE_TOGGLE_FLASH_R              24
 #define MODE_TOGGLE_FLASH_G              24
 #define MODE_TOGGLE_FLASH_B              24
@@ -110,9 +102,6 @@
 // ---------------------------------------------------------------------------
 // Battery behavior thresholds and alert timings
 // ---------------------------------------------------------------------------
-#define LOW_BATTERY_PERCENT              10    // Threshold for low-battery warning behavior.
-#define LOW_BATTERY_FLASH_INTERVAL_MS 900000UL // Repeat interval for low-battery reminder flash.
-
 #define BATTERY_WARN_50_PERCENT          50    // Mid-level warning threshold.
 #define BATTERY_WARN_50_DURATION_MS   30000UL // Mid-level warning message duration.
 

@@ -55,7 +55,6 @@ Most runtime behavior is configured via `#define` values in [src/main.cpp](src/m
 
 | Definition | Default | Acceptable values |
 | --- | --- | --- |
-| `CYCLE_INTERVAL_MS` | `20000` | Positive integer milliseconds |
 | `USB_SAMPLE_INTERVAL_MS` | `15000` | Positive integer milliseconds |
 | `USB_DISPLAY_INTERVAL_MS` | `30000` | Positive integer milliseconds |
 | `BATTERY_SAMPLE_INTERVAL_MS` | `60000` | Positive integer milliseconds |
@@ -77,10 +76,8 @@ Most runtime behavior is configured via `#define` values in [src/main.cpp](src/m
 | `GRAPH_UNDERLINE_FILL_RISING_ONLY` | `1` | `0` (fill all segments), `1` (fill only rising segments) |
 | `TEXT_RIGHT_BALANCED` | `140` | Pixel X coordinate within display width |
 | `GRAPH_X_BALANCED` | `152` | Pixel X coordinate within display width |
-| `GRAPH_W_BALANCED` | `136` | Positive pixel width |
 | `TEXT_RIGHT_GRAPH_HEAVY` | `108` | Pixel X coordinate within display width |
 | `GRAPH_X_GRAPH_HEAVY` | `120` | Pixel X coordinate within display width |
-| `GRAPH_W_GRAPH_HEAVY` | `168` | Positive pixel width |
 | `GRAPH_H_CO2` | `40` | Positive pixel height |
 | `GRAPH_H_STD` | `30` | Positive pixel height |
 | `GRAPH_GAP` | `6` | Non-negative pixel spacing |
@@ -115,9 +112,6 @@ MagTag buttons in order of left to right are D15, D14, D12, D11.
 | `USB_CONNECTED_FLASH_R` | `0` | Integer `0..255` |
 | `USB_CONNECTED_FLASH_G` | `0` | Integer `0..255` |
 | `USB_CONNECTED_FLASH_B` | `200` | Integer `0..255` |
-| `USB_DISCONNECTED_FLASH_R` | `220` | Integer `0..255` |
-| `USB_DISCONNECTED_FLASH_G` | `90` | Integer `0..255` |
-| `USB_DISCONNECTED_FLASH_B` | `0` | Integer `0..255` |
 | `MODE_TOGGLE_FLASH_R` | `24` | Integer `0..255` |
 | `MODE_TOGGLE_FLASH_G` | `24` | Integer `0..255` |
 | `MODE_TOGGLE_FLASH_B` | `24` | Integer `0..255` |
@@ -135,8 +129,6 @@ MagTag buttons in order of left to right are D15, D14, D12, D11.
 
 | Definition | Default | Acceptable values |
 | --- | --- | --- |
-| `LOW_BATTERY_PERCENT` | `10` | Integer percentage `0..100` |
-| `LOW_BATTERY_FLASH_INTERVAL_MS` | `900000UL` | Positive integer milliseconds |
 | `BATTERY_WARN_50_PERCENT` | `50` | Integer percentage `0..100` |
 | `BATTERY_WARN_50_DURATION_MS` | `30000UL` | Positive integer milliseconds |
 | `BATTERY_CRITICAL_PERCENT` | `10` | Integer percentage `0..100` |
