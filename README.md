@@ -89,6 +89,10 @@ Most runtime behavior is configured via `#define` values in [src/main.cpp](src/m
 | `SCREEN_PAD_TOP` | `0` | Non-negative pixels |
 | `SCREEN_PAD_BOTTOM` | `0` | Non-negative pixels |
 
+Graph history is time-based. Buffer sizing is derived from `GRAPH_WINDOW_MINUTES` and the fastest active sampling profile, so the window remains covered when sample intervals are adjusted.
+
+`GRAPH_WINDOW_MINUTES` is the user-facing knob for history depth.
+
 ### Button mapping
 
 MagTag buttons in order of left to right are D15, D14, D12, D11.
@@ -169,7 +173,10 @@ MagTag buttons in order of left to right are D15, D14, D12, D11.
 | `SCD30_I2C_ADDR` | `0x61` | Valid 7-bit I2C address for the sensor |
 | `SCD30_CMD_STOP_MEASUREMENTS` | `0x0104` | Sensor protocol command constant |
 | `SCD30_WARMUP_MS` | `25000` | Positive integer milliseconds |
-| `HISTORY_LEN` | `90` | Positive integer sample slots |
+
+Derived internal values (not user-configurable):
+- `FASTEST_SAMPLE_INTERVAL_MS = min(USB_SAMPLE_INTERVAL_MS, BATTERY_SAMPLE_INTERVAL_MS)`
+- `HISTORY_LEN = ceil((GRAPH_WINDOW_MINUTES * 60 * 1000) / FASTEST_SAMPLE_INTERVAL_MS) + 1`
 
 ## Startup image workflow
 

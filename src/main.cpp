@@ -161,9 +161,12 @@
 #define SCD30_WARMUP_MS               25000   // Cold-start warm-up before trusting readings.
 
 // ---------------------------------------------------------------------------
-// History ring buffer  (30 min @ 20 s/sample = 90 samples)
+// History ring buffer
+//   Size is derived from graph window and fastest configured sample interval,
+//   so changing sample cadence (USB/battery) or window duration stays in sync.
 // ---------------------------------------------------------------------------
-#define HISTORY_LEN 90
+#define FASTEST_SAMPLE_INTERVAL_MS ((USB_SAMPLE_INTERVAL_MS < BATTERY_SAMPLE_INTERVAL_MS) ? USB_SAMPLE_INTERVAL_MS : BATTERY_SAMPLE_INTERVAL_MS)
+#define HISTORY_LEN ((((GRAPH_WINDOW_MINUTES * 60UL * 1000UL) + FASTEST_SAMPLE_INTERVAL_MS - 1) / FASTEST_SAMPLE_INTERVAL_MS) + 1)
 static float histCO2[HISTORY_LEN];
 static float histTempF[HISTORY_LEN];
 static float histRH[HISTORY_LEN];
@@ -437,6 +440,19 @@ static void showBatteryLedFrame(uint8_t litCount, uint8_t red, uint8_t green, ui
     pixels.show();
 }
 
+static void showBatteryStatusColorFrame(uint8_t litCount) {
+    const uint8_t batteryPixelOrder[4] = {3, 2, 1, 0};
+    if (litCount > 4) litCount = 4;
+
+    pixels.clear();
+    for (uint8_t i = 0; i < litCount; i++) {
+        uint8_t red, green, blue;
+        batteryLedTierColor(i + 1, &red, &green, &blue);
+        pixels.setPixelColor(batteryPixelOrder[i], pixels.Color(red, green, blue));
+    }
+    pixels.show();
+}
+
 static void flashBatteryLedTier(uint8_t tier, uint8_t flashes, uint16_t onMs, uint16_t offMs) {
     uint8_t red, green, blue;
     batteryLedTierColor(tier, &red, &green, &blue);
@@ -494,25 +510,23 @@ static void flashPendingBatteryTierIfAny() {
 
 static void playBatteryStartupAnimation(uint8_t batteryPercent) {
     uint8_t tier = batteryLedTierFromPercent(batteryPercent);
-    uint8_t red, green, blue;
-    batteryLedTierColor(tier, &red, &green, &blue);
 
     digitalWrite(NEOPIXEL_POWER, LOW);
     delay(10);
 
     for (uint8_t count = 1; count <= 4; count++) {
-        showBatteryLedFrame(count, red, green, blue);
+        showBatteryStatusColorFrame(count);
         delay(BATTERY_STARTUP_SWEEP_MS);
     }
     for (int8_t count = 3; count >= 1; count--) {
-        showBatteryLedFrame((uint8_t)count, red, green, blue);
+        showBatteryStatusColorFrame((uint8_t)count);
         delay(BATTERY_STARTUP_SWEEP_MS);
     }
 
     pixels.clear();
     pixels.show();
     for (uint8_t i = 0; i < BATTERY_STARTUP_LEVEL_FLASHES; i++) {
-        showBatteryLedFrame(tier, red, green, blue);
+        showBatteryStatusColorFrame(tier);
         delay(BATTERY_LEVEL_FLASH_ON_MS);
         pixels.clear();
         pixels.show();
@@ -1031,7 +1045,7 @@ static void drawGraph(const float *buf, int n,
     };
 #endif
 
-    // x positions are based on sample age over fixed 15-minute window,
+    // x positions are based on sample age over GRAPH_WINDOW_MINUTES,
     // so the graph remains truly time-based across variable sample intervals.
     for (int i = 1; i < win; i++) {
         unsigned long age0 = nowMs - histGetTs(start + i - 1);
