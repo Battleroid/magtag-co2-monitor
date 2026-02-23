@@ -11,6 +11,8 @@ jobs:
   release-update:
     if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
     runs-on: ubuntu-latest
+    outputs:
+      build_number: ${{ steps.meta.outputs.build_number }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,6 +27,11 @@ jobs:
       - name: Update build version + changelog
         run: python tools/post_merge_release.py
 
+      - name: Capture build metadata
+        id: meta
+        run: |
+          echo "build_number=$(cat BUILD_VERSION)" >> "$GITHUB_OUTPUT"
+
       - name: Commit and push release metadata
         run: |
           git config user.name "github-actions[bot]"
@@ -37,3 +44,55 @@ jobs:
           BUILD_NUMBER="$(cat BUILD_VERSION)"
           git commit -m "chore(release): build ${BUILD_NUMBER} [skip ci]"
           git push
+
+  github-release:
+    needs: release-update
+    if: ${{ needs.release-update.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout latest branch state
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync branch after metadata commit
+        run: git pull --ff-only origin "${GITHUB_REF_NAME}"
+
+      - name: Generate release notes from changelog
+        id: notes
+        run: |
+          BUILD_NUMBER="${{ needs.release-update.outputs.build_number }}"
+          TAG="v${BUILD_NUMBER}"
+          NOTES_FILE="release-notes.md"
+
+          awk -v tag="## ${TAG}" '
+            $0 == tag {print; in_section=1; next}
+            in_section && /^## / {exit}
+            in_section {print}
+          ' CHANGELOG.md > "$NOTES_FILE"
+
+          if [ ! -s "$NOTES_FILE" ]; then
+            echo "## ${TAG}" > "$NOTES_FILE"
+            echo >> "$NOTES_FILE"
+            echo "Release created after successful merge." >> "$NOTES_FILE"
+          fi
+
+      - name: Check if release already exists
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ needs.release-update.outputs.build_number }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub release
+        if: ${{ steps.existing.outputs.exists == 'false' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.release-update.outputs.build_number }}
+          name: v${{ needs.release-update.outputs.build_number }}
+          body_path: release-notes.md

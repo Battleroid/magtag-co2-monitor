@@ -56,7 +56,9 @@ This repo includes automated checks and release metadata updates:
 - PR CI (`.github/workflows/pr-checks.yml`): builds firmware on pull requests targeting `master`/`main`.
 - Post-merge CI (`.github/workflows/post-merge-release.yml`): on push to `master`/`main`, updates:
    - `BUILD_VERSION` to the current commit count (`git rev-list --count HEAD`), and
-   - `CHANGELOG.md` by adding a `## v<build> - <date>` section with per-commit bullets and GitHub commit-hash links, then commits those changes automatically.
+   - `CHANGELOG.md` by adding a `## v<build> - <date>` section with per-commit bullets and GitHub commit-hash links,
+   - creates a GitHub Release `v<build>` using that changelog section as release notes,
+   - then commits metadata changes automatically.
 
 To enable local hooks after cloning/setup:
 
