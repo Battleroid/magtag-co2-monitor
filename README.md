@@ -91,6 +91,8 @@ Most runtime behavior is configured via `#define` values in [src/main.cpp](src/m
 
 ### Button mapping
 
+MagTag buttons in order of left to right are D15, D14, D12, D11.
+
 | Definition | Default | Acceptable values |
 | --- | --- | --- |
 | `MODE_BTN` | `12` | Valid ESP32-S2 GPIO used by a button |
@@ -189,6 +191,36 @@ Board/environment is configured in [platformio.ini](platformio.ini):
 - `env:magtag`
 - board: `adafruit_magtag29_esp32s2`
 - framework: `arduino`
+
+## Warnings
+
+### Power source detection on MagTag is heuristic
+
+MagTag does not expose a single reliable hardware signal that always tells firmware whether it is on USB power or battery.
+
+This firmware combines two signals:
+
+1. USB stack mount/unmount events (best signal when a USB host is present), and
+2. battery voltage trend heuristic (used as fallback, especially for dumb chargers/power banks).
+
+Because of this, power mode can occasionally be misclassified for short periods, especially:
+
+- right after plug/unplug transitions,
+- with noisy/weak USB sources,
+- with some power banks that pulse or auto-sleep,
+- when battery voltage is near threshold boundaries.
+
+### Practical implications
+
+- Sample/display cadence may briefly use the wrong profile after transitions.
+- USB connected/disconnected LED indications may lag or flicker during unstable power.
+- Battery percentage and warning behavior are estimates based on voltage, not coulomb counting.
+
+### Recommended usage
+
+- Keep default `POWER_CHECK_INTERVAL_MS` unless you are actively tuning for your specific power setup.
+- Validate battery warning thresholds under real-world load before relying on them.
+- If deterministic behavior is required for your installation, prefer running continuously on stable USB host power.
 
 ## Notes
 

@@ -37,7 +37,6 @@
 #define INVERT_FLASH_MS                   150   // UI toggle feedback flash duration.
 
 #define GRAPH_WINDOW_MINUTES               15   // Time span shown on graphs.
-#define GRAPH_WINDOW_SAMPLES ((GRAPH_WINDOW_MINUTES * 60 * 1000) / CYCLE_INTERVAL_MS) // Window size at nominal cadence.
 
 // ---------------------------------------------------------------------------
 // Display layout and rendering (where things are drawn)
