@@ -1,7 +1,8 @@
-.PHONY: build upload monitor clean all install image images
+.PHONY: build upload monitor clean all install image images hooks
 
 PLATFORMIO := $(if $(wildcard .venv/bin/pio),.venv/bin/pio,platformio)
 PYTHON := $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
+PRE_COMMIT := $(if $(wildcard .venv/bin/pre-commit),.venv/bin/pre-commit,pre-commit)
 IMAGE_WIDTH := 296
 IMAGE_HEIGHT := 128
 
@@ -59,6 +60,10 @@ image:
 
 # Build, upload, and open serial monitor
 all: upload monitor
+
+# Install local git hooks for pre-commit workflow
+hooks:
+	$(PRE_COMMIT) install
 
 # Remove build artifacts
 clean:

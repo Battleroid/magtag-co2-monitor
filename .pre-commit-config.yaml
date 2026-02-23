@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: firmware-build
+        name: Firmware build regression check
+        entry: make build
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]

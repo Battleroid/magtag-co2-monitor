@@ -70,14 +70,19 @@ source "$VENV_DIR/bin/activate"
 log "Upgrading pip/setuptools/wheel"
 python -m pip install --upgrade pip setuptools wheel
 
-log "Installing Python tooling (PlatformIO + Pillow)"
-python -m pip install --upgrade platformio pillow
+log "Installing Python tooling (PlatformIO + Pillow + pre-commit)"
+python -m pip install --upgrade platformio pillow pre-commit
 
 log "Verifying PlatformIO install"
 pio --version
 
 log "Pre-fetching PlatformIO platform/libraries"
 pio pkg install -e magtag
+
+if [[ -f "$ROOT_DIR/.pre-commit-config.yaml" ]]; then
+  log "Installing git hooks (pre-commit)"
+  pre-commit install
+fi
 
 if id -nG "$USER" | grep -qw dialout; then
   log "User '$USER' is in dialout group."
