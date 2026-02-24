@@ -740,6 +740,13 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
 static void enterLightSleepMs(uint32_t sleepMs) {
     // ── Power down peripherals (mirror deep-sleep path for consistency) ──
 
+    // Stop SCD30 continuous measurement to save ~19 mA during sleep.
+    if (scd30Ready) {
+        if (!stopScd30Measurements()) {
+            Serial.println("Warning: failed to send SCD30 stop command (light sleep)");
+        }
+    }
+
     // E-ink display: software power-down + hold RESET low
     display.powerDown();
     digitalWrite(EPD_RESET, LOW);
@@ -782,6 +789,16 @@ static void enterLightSleepMs(uint32_t sleepMs) {
     // light sleep which can leave SPI/I2C peripherals in an undefined state.
     SPI.begin();
     Wire.begin(SDA, SCL);
+
+    // Restart SCD30 continuous measurement (was stopped before sleep).
+    // The sensor optics are still warm from the brief idle, so no extended
+    // warm-up is needed — the next measurement interval (~2 s) is sufficient.
+    if (scd30Ready) {
+        if (!scd30.begin()) {
+            Serial.println("Warning: SCD30 re-init failed after light sleep");
+            scd30Ready = false;
+        }
+    }
 
     lightSleepWakePending = true;
     Serial.printf("Woke from light sleep, cause: %d\n", (int)esp_sleep_get_wakeup_cause());
