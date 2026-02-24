@@ -84,6 +84,7 @@ Most runtime behavior is configured via `#define` values in [src/main.cpp](src/m
 | `FLASH_DURATION_MS` | `500` | Positive integer milliseconds |
 | `STARTUP_FLASH_MS` | `220` | Positive integer milliseconds |
 | `INVERT_FLASH_MS` | `150` | Positive integer milliseconds |
+| `STARTUP_BUILD_INFO_MS` | `5000` | Positive integer milliseconds |
 
 ### Graph & layout
 
@@ -91,9 +92,10 @@ Most runtime behavior is configured via `#define` values in [src/main.cpp](src/m
 | --- | --- | --- |
 | `GRAPH_WINDOW_MINUTES` | `15` | Positive integer minutes (`>= 1`) |
 | `GRAPH_LINE_THICKNESS` | `1` | Integer pixel thickness (`>= 1`) |
-| `GRAPH_UNDERLINE_LIGHT_FILL` | `1` | `0` (off), `1` (on) |
-| `GRAPH_UNDERLINE_FILL_SHADE` | `EPD_DARK` | `EPD_WHITE`, `EPD_LIGHT`, `EPD_DARK`, `EPD_GRAY` |
-| `GRAPH_UNDERLINE_FILL_RISING_ONLY` | `1` | `0` (fill all segments), `1` (fill only rising segments) |
+| `GRAPH_FILL_MODE` | `4` | `0` none, `1` solid underline, `2` checkerboard dither (~50%), `3` vertical lines, `4` sparse dither (~25%) |
+| `GRAPH_FILL_SHADE` | `EPD_DARK` | `EPD_LIGHT`, `EPD_DARK`, `EPD_GRAY` |
+| `GRAPH_FILL_RISING_ONLY` | `0` | `0` (fill all segments), `1` (fill only rising segments) |
+| `GRAPH_FILL_VLINE_SPACING` | `2` | Positive integer column spacing (used by `GRAPH_FILL_VLINES` mode) |
 | `TEXT_RIGHT_BALANCED` | `140` | Pixel X coordinate within display width |
 | `GRAPH_X_BALANCED` | `152` | Pixel X coordinate within display width |
 | `TEXT_RIGHT_GRAPH_HEAVY` | `108` | Pixel X coordinate within display width |
@@ -112,12 +114,30 @@ Graph history is time-based. Buffer sizing is derived from `GRAPH_WINDOW_MINUTES
 
 ### Button mapping
 
-MagTag buttons in order of left to right are D15, D14, D12, D11.
+MagTag buttons in order from left to right are **D15**, **D14**, **D12**, **D11** (GPIOs 15, 14, 12, 11). All buttons are active-low with internal pull-ups.
+
+| Definition | Default | GPIO | Description |
+| --- | --- | --- | --- |
+| `STATS_BTN` | `15` | D15 (leftmost) | Show battery/system stats overlay |
+| `CAROUSEL_BTN` | `14` | D14 | Toggle automatic display-mode carousel |
+| `MODE_BTN` | `12` | D12 | Cycle through display modes |
+| `SLEEP_TOGGLE_BTN` | `11` | D11 (rightmost) | Long-press to toggle deep/light sleep |
+
+#### Button behavior details
+
+- **D15 — Stats:** Briefly shows a stats overlay (battery %, voltage, build info) for `STATS_DISPLAY_MS` then restores the normal view.
+- **D14 — Carousel:** Toggles automatic mode cycling on/off. Purple flash = carousel ON, red flash = carousel OFF.
+- **D12 — Mode:** Steps through display modes: Combined → CO2-only → Temp-only → RH-only → Temp+RH → Text-only.
+- **D11 — Sleep toggle:** Hold for `SLEEP_TOGGLE_HOLD_MS` to switch between light-sleep and deep-sleep battery modes. Dark-blue center flash = deep sleep ON, light-blue all-pixel flash = deep sleep OFF.
 
 | Definition | Default | Acceptable values |
 | --- | --- | --- |
 | `MODE_BTN` | `12` | Valid ESP32-S2 GPIO used by a button |
 | `CAROUSEL_BTN` | `14` | Valid ESP32-S2 GPIO used by a button |
+| `SLEEP_TOGGLE_BTN` | `11` | Valid ESP32-S2 GPIO used by a button |
+| `SLEEP_TOGGLE_HOLD_MS` | `2000` | Positive integer milliseconds (hold duration) |
+| `STATS_BTN` | `15` | Valid ESP32-S2 GPIO used by a button |
+| `STATS_DISPLAY_MS` | `5000` | Positive integer milliseconds (overlay duration) |
 
 ### NeoPixel colors
 
@@ -141,6 +161,15 @@ MagTag buttons in order of left to right are D15, D14, D12, D11.
 | `CAROUSEL_OFF_FLASH_R` | `255` | Integer `0..255` |
 | `CAROUSEL_OFF_FLASH_G` | `0` | Integer `0..255` |
 | `CAROUSEL_OFF_FLASH_B` | `0` | Integer `0..255` |
+| `DEEP_SLEEP_ON_FLASH_R` | `0` | Integer `0..255` |
+| `DEEP_SLEEP_ON_FLASH_G` | `0` | Integer `0..255` |
+| `DEEP_SLEEP_ON_FLASH_B` | `80` | Integer `0..255` |
+| `DEEP_SLEEP_OFF_FLASH_R` | `80` | Integer `0..255` |
+| `DEEP_SLEEP_OFF_FLASH_G` | `120` | Integer `0..255` |
+| `DEEP_SLEEP_OFF_FLASH_B` | `255` | Integer `0..255` |
+| `STATS_FLASH_R` | `60` | Integer `0..255` |
+| `STATS_FLASH_G` | `60` | Integer `0..255` |
+| `STATS_FLASH_B` | `60` | Integer `0..255` |
 | `GENERIC_RED_FLASH_R` | `255` | Integer `0..255` |
 | `GENERIC_RED_FLASH_G` | `0` | Integer `0..255` |
 | `GENERIC_RED_FLASH_B` | `0` | Integer `0..255` |
@@ -149,6 +178,7 @@ MagTag buttons in order of left to right are D15, D14, D12, D11.
 
 | Definition | Default | Acceptable values |
 | --- | --- | --- |
+| `BATTERY_CAPACITY_MAH` | `4400` | Positive integer mAh (set to match your LiPo) |
 | `BATTERY_WARN_50_PERCENT` | `50` | Integer percentage `0..100` |
 | `BATTERY_WARN_50_DURATION_MS` | `30000UL` | Positive integer milliseconds |
 | `BATTERY_CRITICAL_PERCENT` | `10` | Integer percentage `0..100` |
