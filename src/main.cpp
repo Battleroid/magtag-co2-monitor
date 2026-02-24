@@ -59,9 +59,17 @@
 // Display layout and rendering (where things are drawn)
 // ---------------------------------------------------------------------------
 #define GRAPH_LINE_THICKNESS              1    // Line thickness used for history traces.
-#define GRAPH_UNDERLINE_LIGHT_FILL        1    // Fill area under graph line with light gray when enabled.
-#define GRAPH_UNDERLINE_FILL_SHADE EPD_DARK    // Under-line fill shade: EPD_LIGHT, EPD_DARK, EPD_GRAY, or EPD_WHITE.
-#define GRAPH_UNDERLINE_FILL_RISING_ONLY  1    // When enabled, only rising segments get under-line fill.
+
+// Graph fill mode — choose exactly one:
+//   GRAPH_FILL_NONE            0  No fill under the graph line.
+//   GRAPH_FILL_UNDERLINE       1  Solid shade fill under the line (original behavior).
+//   GRAPH_FILL_DITHER          2  Checkerboard dither pattern under the line (~50% density).
+//   GRAPH_FILL_VLINES          3  Vertical lines every N columns under the line.
+//   GRAPH_FILL_SPARSE_DITHER   4  Sparse dither — every other pixel on every other row (~25% density).
+#define GRAPH_FILL_MODE                   4    // Active fill style (see list above).
+#define GRAPH_FILL_SHADE           EPD_DARK    // Shade used by all fill modes: EPD_LIGHT, EPD_DARK, EPD_GRAY.
+#define GRAPH_FILL_RISING_ONLY            0    // When enabled, only rising segments get fill.
+#define GRAPH_FILL_VLINE_SPACING          2    // Column spacing for GRAPH_FILL_VLINES mode.
 
 // Combined view layout presets on 296x128 panel.
 #define TEXT_RIGHT_BALANCED             140    // Right edge of value text in balanced layout.
@@ -224,6 +232,7 @@ enum DisplayMode : uint8_t {
     DISPLAY_MODE_TEMP_ONLY,
     DISPLAY_MODE_RH_ONLY,
     DISPLAY_MODE_TEMP_RH,
+    DISPLAY_MODE_TEXT_ONLY,            // CO2 left + temp/RH right, no graphs
     DISPLAY_MODE_COUNT
 };
 
@@ -884,6 +893,7 @@ static const char *displayModeName(uint8_t mode) {
         case DISPLAY_MODE_TEMP_ONLY: return "TEMP";
         case DISPLAY_MODE_RH_ONLY: return "HUMIDITY";
         case DISPLAY_MODE_TEMP_RH: return "TEMP_RH";
+        case DISPLAY_MODE_TEXT_ONLY: return "TEXT_ONLY";
         default: return "UNKNOWN";
     }
 }
@@ -1274,16 +1284,31 @@ static void drawGraph(const float *buf, int n,
         return gy + gh - 1 - (int16_t)(frac * (gh - 1)); // top = high
     };
 
-#if GRAPH_UNDERLINE_LIGHT_FILL
+#if GRAPH_FILL_MODE != 0
     auto fillUnderSegment = [&](int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
-        const uint16_t shade = GRAPH_UNDERLINE_FILL_SHADE;
+        const uint16_t shade = GRAPH_FILL_SHADE;
         const int16_t graphRight = gx + gw - 1;
 
         if (x0 == x1) {
             if (x0 < gx || x0 > graphRight) return;
             if (y0 < gy) y0 = gy;
             if (y0 > graphBottom) y0 = graphBottom;
+#if GRAPH_FILL_MODE == 1
             display.drawLine(x0, y0, x0, graphBottom, shade);
+#elif GRAPH_FILL_MODE == 2
+            for (int16_t py = y0; py <= graphBottom; ++py) {
+                if ((x0 + py) & 1) display.drawPixel(x0, py, shade);
+            }
+#elif GRAPH_FILL_MODE == 3
+            if (((x0 - gx) % GRAPH_FILL_VLINE_SPACING) == 0)
+                display.drawLine(x0, y0, x0, graphBottom, shade);
+#elif GRAPH_FILL_MODE == 4
+            if (x0 & 1) {
+                for (int16_t py = y0; py <= graphBottom; py += 2) {
+                    display.drawPixel(x0, py, shade);
+                }
+            }
+#endif
             return;
         }
 
@@ -1299,7 +1324,22 @@ static void drawGraph(const float *buf, int n,
             int16_t y = (int16_t)(y0 + (y1 - y0) * t);
             if (y < gy) y = gy;
             if (y > graphBottom) y = graphBottom;
+#if GRAPH_FILL_MODE == 1
             display.drawLine(x, y, x, graphBottom, shade);
+#elif GRAPH_FILL_MODE == 2
+            for (int16_t py = y; py <= graphBottom; ++py) {
+                if ((x + py) & 1) display.drawPixel(x, py, shade);
+            }
+#elif GRAPH_FILL_MODE == 3
+            if (((x - gx) % GRAPH_FILL_VLINE_SPACING) == 0)
+                display.drawLine(x, y, x, graphBottom, shade);
+#elif GRAPH_FILL_MODE == 4
+            if (x & 1) {
+                for (int16_t py = y; py <= graphBottom; py += 2) {
+                    display.drawPixel(x, py, shade);
+                }
+            }
+#endif
         }
     };
 #endif
@@ -1315,8 +1355,8 @@ static void drawGraph(const float *buf, int n,
         float v1 = histGet(buf, start + i);
         int16_t y0 = yForVal(v0);
         int16_t y1 = yForVal(v1);
-#if GRAPH_UNDERLINE_LIGHT_FILL
-    #if GRAPH_UNDERLINE_FILL_RISING_ONLY
+#if GRAPH_FILL_MODE != 0
+    #if GRAPH_FILL_RISING_ONLY
         if (v1 > v0) {
             fillUnderSegment(x0, y0, x1, y1);
         }
@@ -1488,7 +1528,7 @@ void updateDisplay(float co2, float tempF, float rh) {
         printRightAligned(textRight, yLow, buf);
 
         drawGraph(metricBuf, n, graphX, contentTop + 2, graphW, contentH - 4);
-    } else {
+    } else if (currentDisplayMode == DISPLAY_MODE_TEMP_RH) {
         int16_t textRight = contentLeft + TEXT_RIGHT_GRAPH_HEAVY;
         int16_t graphX = contentLeft + GRAPH_X_GRAPH_HEAVY;
         int16_t graphW = contentRight - graphX + 1;
@@ -1507,6 +1547,56 @@ void updateDisplay(float co2, float tempF, float rh) {
 
         drawGraph(histTempF, n, graphX, upperY, graphW, halfH);
         drawGraph(histRH,    n, graphX, lowerY, graphW, halfH);
+    } else {
+        // DISPLAY_MODE_TEXT_ONLY: CO2 left half, temp+RH right half (no graphs)
+        int16_t screenW = display.width();
+        int16_t screenH = display.height();
+        int16_t halfW = screenW / 2;
+
+        // Left half: CO2 + "ppm"
+        display.setTextSize(3);
+        snprintf(buf, sizeof(buf), "%d", (int)co2);
+        int16_t bx, by; uint16_t bw, bh;
+        display.getTextBounds(buf, 0, 0, &bx, &by, &bw, &bh);
+        uint16_t co2NumW = bw, co2NumH = bh;
+
+        display.setTextSize(2);
+        uint16_t ppmW, ppmH;
+        display.getTextBounds("ppm", 0, 0, &bx, &by, &ppmW, &ppmH);
+
+        int16_t gap = 4;
+        int16_t totalCO2H = (int16_t)co2NumH + gap + (int16_t)ppmH;
+        int16_t co2StartY = (screenH - totalCO2H) / 2;
+
+        display.setTextSize(3);
+        display.setCursor((halfW - (int16_t)co2NumW) / 2, co2StartY);
+        display.print(buf);
+
+        display.setTextSize(2);
+        display.setCursor((halfW - (int16_t)ppmW) / 2, co2StartY + (int16_t)co2NumH + gap);
+        display.print("ppm");
+
+        // Right half: temp + humidity
+        display.setTextSize(2);
+        snprintf(buf, sizeof(buf), "%.1f F", tempF);
+        display.getTextBounds(buf, 0, 0, &bx, &by, &bw, &bh);
+        uint16_t tempW = bw, tempH = bh;
+
+        char rhBuf[32];
+        snprintf(rhBuf, sizeof(rhBuf), "%.1f %%", rh);
+        uint16_t rhW, rhH;
+        display.getTextBounds(rhBuf, 0, 0, &bx, &by, &rhW, &rhH);
+
+        uint16_t maxW = (tempW > rhW) ? tempW : rhW;
+        int16_t rightGap = 8;
+        int16_t totalRightH = (int16_t)tempH + rightGap + (int16_t)rhH;
+        int16_t rightStartY = (screenH - totalRightH) / 2;
+        int16_t rightStartX = halfW + (halfW - (int16_t)maxW) / 2;
+
+        display.setCursor(rightStartX, rightStartY);
+        display.print(buf);
+        display.setCursor(rightStartX, rightStartY + (int16_t)tempH + rightGap);
+        display.print(rhBuf);
     }
 
     display.display();
