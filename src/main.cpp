@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_SCD30.h>
 #include <Adafruit_NeoPixel.h>
@@ -58,9 +59,17 @@
 // Display layout and rendering (where things are drawn)
 // ---------------------------------------------------------------------------
 #define GRAPH_LINE_THICKNESS              1    // Line thickness used for history traces.
-#define GRAPH_UNDERLINE_LIGHT_FILL        1    // Fill area under graph line with light gray when enabled.
-#define GRAPH_UNDERLINE_FILL_SHADE EPD_DARK    // Under-line fill shade: EPD_LIGHT, EPD_DARK, EPD_GRAY, or EPD_WHITE.
-#define GRAPH_UNDERLINE_FILL_RISING_ONLY  1    // When enabled, only rising segments get under-line fill.
+
+// Graph fill mode — choose exactly one:
+//   GRAPH_FILL_NONE            0  No fill under the graph line.
+//   GRAPH_FILL_UNDERLINE       1  Solid shade fill under the line (original behavior).
+//   GRAPH_FILL_DITHER          2  Checkerboard dither pattern under the line (~50% density).
+//   GRAPH_FILL_VLINES          3  Vertical lines every N columns under the line.
+//   GRAPH_FILL_SPARSE_DITHER   4  Sparse dither — every other pixel on every other row (~25% density).
+#define GRAPH_FILL_MODE                   4    // Active fill style (see list above).
+#define GRAPH_FILL_SHADE           EPD_DARK    // Shade used by all fill modes: EPD_LIGHT, EPD_DARK, EPD_GRAY.
+#define GRAPH_FILL_RISING_ONLY            0    // When enabled, only rising segments get fill.
+#define GRAPH_FILL_VLINE_SPACING          2    // Column spacing for GRAPH_FILL_VLINES mode.
 
 // Combined view layout presets on 296x128 panel.
 #define TEXT_RIGHT_BALANCED             140    // Right edge of value text in balanced layout.
@@ -84,6 +93,10 @@
 // ---------------------------------------------------------------------------
 #define MODE_BTN                         12    // D12: cycle display mode.
 #define CAROUSEL_BTN                     14    // D14: toggle carousel mode.
+#define SLEEP_TOGGLE_BTN                 11    // D11: long-press to toggle deep/light sleep.
+#define SLEEP_TOGGLE_HOLD_MS           2000    // Hold D11 for this long to toggle sleep mode.
+#define STATS_BTN                        15    // D15: show battery/system stats overlay.
+#define STATS_DISPLAY_MS               5000    // Duration to show stats screen before restoring.
 
 // ---------------------------------------------------------------------------
 // NeoPixel feedback colors (what each event looks like)
@@ -112,6 +125,18 @@
 #define CAROUSEL_OFF_FLASH_G              0
 #define CAROUSEL_OFF_FLASH_B              0
 
+#define DEEP_SLEEP_ON_FLASH_R             0    // Deep sleep toggle ON: dark blue (center 2 pixels).
+#define DEEP_SLEEP_ON_FLASH_G             0
+#define DEEP_SLEEP_ON_FLASH_B            80
+
+#define DEEP_SLEEP_OFF_FLASH_R           80    // Deep sleep toggle OFF: light blue (all 4 pixels).
+#define DEEP_SLEEP_OFF_FLASH_G          120
+#define DEEP_SLEEP_OFF_FLASH_B          255
+
+#define STATS_FLASH_R                    60    // Stats button: dim white flash.
+#define STATS_FLASH_G                    60
+#define STATS_FLASH_B                    60
+
 #define GENERIC_RED_FLASH_R             255
 #define GENERIC_RED_FLASH_G               0
 #define GENERIC_RED_FLASH_B               0
@@ -119,6 +144,8 @@
 // ---------------------------------------------------------------------------
 // Battery behavior thresholds and alert timings
 // ---------------------------------------------------------------------------
+#define BATTERY_CAPACITY_MAH           4400    // Battery capacity in mAh — set to match your LiPo.
+
 #define BATTERY_WARN_50_PERCENT          50    // Mid-level warning threshold.
 #define BATTERY_WARN_50_DURATION_MS   30000UL // Mid-level warning message duration.
 
@@ -213,11 +240,24 @@ enum DisplayMode : uint8_t {
     DISPLAY_MODE_TEMP_ONLY,
     DISPLAY_MODE_RH_ONLY,
     DISPLAY_MODE_TEMP_RH,
+    DISPLAY_MODE_TEXT_ONLY,            // CO2 left + temp/RH right, no graphs
     DISPLAY_MODE_COUNT
 };
 
 static uint8_t currentDisplayMode = DISPLAY_MODE_COMBINED;
 static bool carouselModeEnabled = false;
+
+enum DeepDisplayMode : uint8_t {
+    DEEP_DISPLAY_MODE_COMBINED = 0,   // CO2 left half, temp+RH right half
+    DEEP_DISPLAY_MODE_CO2_ONLY,       // CO2 centered full screen
+    DEEP_DISPLAY_MODE_TEMP_ONLY,      // Temp centered full screen
+    DEEP_DISPLAY_MODE_RH_ONLY,        // RH centered full screen
+    DEEP_DISPLAY_MODE_COUNT
+};
+
+static uint8_t currentDeepDisplayMode = DEEP_DISPLAY_MODE_COMBINED;
+static bool deepSleepEnabled = false;
+static bool lightSleepWakePending = false;   // set after waking from light sleep
 
 // Last displayed values (for immediate redraw on button toggles)
 static float lastCO2   = 0;
@@ -240,6 +280,12 @@ static bool usbByHeuristic = false;
 
 // USB event-driven mount tracking (set from TinyUSB task context)
 static volatile bool usbMounted = false;
+
+// FreeRTOS button task handles — created for USB mode, deleted on battery transition
+static TaskHandle_t modeButtonTaskHandle     = nullptr;
+static TaskHandle_t carouselButtonTaskHandle  = nullptr;
+static TaskHandle_t sleepToggleTaskHandle     = nullptr;
+static TaskHandle_t statsButtonTaskHandle     = nullptr;
 RTC_DATA_ATTR static uint32_t batterySampleCycles = 0;
 RTC_DATA_ATTR static uint32_t batterySampleElapsedMs = BATTERY_SAMPLE_INTERVAL_MS;
 RTC_DATA_ATTR static bool batteryWarn50Shown = false;
@@ -259,6 +305,8 @@ RTC_DATA_ATTR static float    rtcLastCO2            = 0;
 RTC_DATA_ATTR static float    rtcLastTempF          = 0;
 RTC_DATA_ATTR static float    rtcLastRH             = 0;
 RTC_DATA_ATTR static bool     rtcHasReading         = false;
+RTC_DATA_ATTR static bool     rtcDeepSleepEnabled   = false;
+RTC_DATA_ATTR static uint8_t  rtcDeepDisplayMode    = DEEP_DISPLAY_MODE_COMBINED;
 
 static bool wokeFromDeepSleep = false;
 static uint8_t buttonWakeGPIO = 0;   // which button GPIO caused wake (0 = none)
@@ -642,6 +690,8 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
     rtcHasReading     = hasReading;
     rtcLastUsbPowerPresent = usbPowerPresent;
     rtcHasUsbPowerState = true;
+    rtcDeepSleepEnabled = deepSleepEnabled;
+    rtcDeepDisplayMode  = currentDeepDisplayMode;
 
     // Stop SCD30 continuous measurement (only if we started it)
     if (scd30Ready) {
@@ -660,9 +710,6 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
     display.powerDown();
     digitalWrite(EPD_RESET, LOW);
 
-    // Power down LIS3DH accelerometer
-    lis.setDataRate(LIS3DH_DATARATE_POWERDOWN);
-
     // Power off NeoPixels and speaker amp
     digitalWrite(NEOPIXEL_POWER, HIGH);
     digitalWrite(SPEAKER_SHUTDOWN, LOW);
@@ -671,8 +718,8 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
     // Timer wake for periodic sampling
     esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
 
-    // Button wake: D14 (carousel), D12 (mode) — active-low
-    uint64_t buttonMask = (1ULL << CAROUSEL_BTN) | (1ULL << MODE_BTN);
+    // Button wake: D14 (carousel), D12 (mode), D11 (sleep toggle), D15 (stats) — active-low
+    uint64_t buttonMask = (1ULL << CAROUSEL_BTN) | (1ULL << MODE_BTN) | (1ULL << SLEEP_TOGGLE_BTN) | (1ULL << STATS_BTN);
     esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ANY_LOW);
 
     // Keep RTC peripherals powered so internal pull-ups stay active
@@ -680,7 +727,7 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
 
     // Explicitly enable RTC-domain pull-ups on button GPIOs to prevent
     // floating inputs from triggering spurious ext1 wakes during sleep.
-    const gpio_num_t btnPins[] = { (gpio_num_t)CAROUSEL_BTN, (gpio_num_t)MODE_BTN };
+    const gpio_num_t btnPins[] = { (gpio_num_t)CAROUSEL_BTN, (gpio_num_t)MODE_BTN, (gpio_num_t)SLEEP_TOGGLE_BTN, (gpio_num_t)STATS_BTN };
     for (auto pin : btnPins) {
         rtc_gpio_init(pin);
         rtc_gpio_set_direction(pin, RTC_GPIO_MODE_INPUT_ONLY);
@@ -695,11 +742,91 @@ static void enterDeepSleepMs(uint32_t sleepMs) {
     esp_deep_sleep_start();
 }
 
+// ---------------------------------------------------------------------------
+// Light sleep: CPU pauses, RAM preserved, execution resumes here on wake.
+// Used as the default battery sleep mode to retain graph history in PSRAM.
+// ---------------------------------------------------------------------------
+static void enterLightSleepMs(uint32_t sleepMs) {
+    // ── Power down peripherals (mirror deep-sleep path for consistency) ──
+
+    // Stop SCD30 continuous measurement to save ~19 mA during sleep.
+    if (scd30Ready) {
+        if (!stopScd30Measurements()) {
+            Serial.println("Warning: failed to send SCD30 stop command (light sleep)");
+        }
+    }
+
+    // E-ink display: software power-down + hold RESET low
+    display.powerDown();
+    digitalWrite(EPD_RESET, LOW);
+
+    // NeoPixels and speaker amp off
+    digitalWrite(NEOPIXEL_POWER, HIGH);
+    digitalWrite(SPEAKER_SHUTDOWN, LOW);
+
+    // --- Wake sources ---
+    esp_sleep_enable_timer_wakeup((uint64_t)sleepMs * 1000ULL);
+
+    // Button wake: D14 (carousel), D12 (mode), D11 (sleep toggle), D15 (stats) — active-low
+    uint64_t buttonMask = (1ULL << CAROUSEL_BTN) | (1ULL << MODE_BTN) | (1ULL << SLEEP_TOGGLE_BTN) | (1ULL << STATS_BTN);
+    esp_sleep_enable_ext1_wakeup(buttonMask, ESP_EXT1_WAKEUP_ANY_LOW);
+
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+
+    const gpio_num_t btnPins[] = { (gpio_num_t)CAROUSEL_BTN, (gpio_num_t)MODE_BTN, (gpio_num_t)SLEEP_TOGGLE_BTN, (gpio_num_t)STATS_BTN };
+    for (auto pin : btnPins) {
+        rtc_gpio_init(pin);
+        rtc_gpio_set_direction(pin, RTC_GPIO_MODE_INPUT_ONLY);
+        rtc_gpio_pullup_en(pin);
+        rtc_gpio_pulldown_dis(pin);
+    }
+
+    Serial.printf("Light sleep %lu ms\n", (unsigned long)sleepMs);
+    Serial.flush();
+
+    esp_light_sleep_start();
+
+    // ── Execution resumes here after light sleep ──
+
+    // Restore button GPIOs from RTC mode
+    for (auto pin : btnPins) {
+        rtc_gpio_deinit(pin);
+        pinMode((uint8_t)pin, INPUT_PULLUP);
+    }
+
+    // Re-initialize peripheral buses — ESP32-S2 APB clock stops during
+    // light sleep which can leave SPI/I2C peripherals in an undefined state.
+    SPI.begin();
+    Wire.begin(SDA, SCL);
+
+    // Restart SCD30 continuous measurement (was stopped before sleep).
+    // The sensor optics are still warm from the brief idle, so no extended
+    // warm-up is needed — the next measurement interval (~2 s) is sufficient.
+    if (scd30Ready) {
+        if (!scd30.begin()) {
+            Serial.println("Warning: SCD30 re-init failed after light sleep");
+            scd30Ready = false;
+        }
+    }
+
+    lightSleepWakePending = true;
+    Serial.printf("Woke from light sleep, cause: %d\n", (int)esp_sleep_get_wakeup_cause());
+}
+
 // Forward declarations
 void updateDisplay(float co2, float tempF, float rh);
+void updateDisplayDeepSleep(float co2, float tempF, float rh);
 static void flashNeopixelsColor(uint8_t red, uint8_t green, uint8_t blue, uint16_t ms);
+static void flashCenterNeopixels(uint8_t r, uint8_t g, uint8_t b, uint16_t ms);
 static void advanceDisplayMode();
+static void advanceDeepDisplayMode();
 static const char *displayModeName(uint8_t mode);
+static const char *displayModeNameDeep(uint8_t mode);
+static void showSleepModeStatus();
+static void handleSleepToggle();
+static void handleStatsButtonPress();
+static void enterLightSleepMs(uint32_t sleepMs);
+void showStatus(const char *msg);
 
 // ---------------------------------------------------------------------------
 // Battery-mode helper: handle a button press by GPIO number.
@@ -707,8 +834,14 @@ static const char *displayModeName(uint8_t mode);
 // ---------------------------------------------------------------------------
 static void applyButtonAction(uint8_t gpio) {
     if (gpio == MODE_BTN) {
-        advanceDisplayMode();
-        Serial.printf("Button → mode: %s\n", displayModeName(currentDisplayMode));
+        if (deepSleepEnabled && !usbPowerPresent) {
+            advanceDeepDisplayMode();
+            Serial.printf("Button → deep mode: %s\n", displayModeNameDeep(currentDeepDisplayMode));
+        } else {
+            advanceDisplayMode();
+            Serial.printf("Button → mode: %s\n", displayModeName(currentDisplayMode));
+        }
+        flashNeopixelsColor(MODE_TOGGLE_FLASH_R, MODE_TOGGLE_FLASH_G, MODE_TOGGLE_FLASH_B, INVERT_FLASH_MS);
         playModeToggleTone();
     } else if (gpio == CAROUSEL_BTN) {
         carouselModeEnabled = !carouselModeEnabled;
@@ -719,12 +852,20 @@ static void applyButtonAction(uint8_t gpio) {
             flashNeopixelsColor(CAROUSEL_OFF_FLASH_R, CAROUSEL_OFF_FLASH_G, CAROUSEL_OFF_FLASH_B, INVERT_FLASH_MS);
         }
         playModeToggleTone();
+    } else if (gpio == STATS_BTN) {
+        Serial.println("Button → stats");
+        handleStatsButtonPress();
+        return;  // handleStatsButtonPress already restores display
     } else {
         return;
     }
 
     if (hasReading) {
-        updateDisplay(lastCO2, lastTempF, lastRH);
+        if (deepSleepEnabled && !usbPowerPresent) {
+            updateDisplayDeepSleep(lastCO2, lastTempF, lastRH);
+        } else {
+            updateDisplay(lastCO2, lastTempF, lastRH);
+        }
         lastDisplayMs = millis();
     }
 }
@@ -734,9 +875,11 @@ static void applyButtonAction(uint8_t gpio) {
 // Detects new presses (edge-triggered) and immediately processes them.
 // ---------------------------------------------------------------------------
 static void delayWithButtonPolling(uint32_t waitMs) {
-    const uint8_t btnPins[] = { MODE_BTN, CAROUSEL_BTN };
+    const uint8_t btnPins[] = { MODE_BTN, CAROUSEL_BTN, SLEEP_TOGGLE_BTN, STATS_BTN };
     const int btnCount = sizeof(btnPins) / sizeof(btnPins[0]);
-    bool prevState[2] = { false, false };
+    bool prevState[4] = { false, false, false, false };
+    unsigned long d11DownAt = 0;
+    bool d11Held = false;
 
     // Seed previous state so already-held buttons don't re-trigger
     for (int i = 0; i < btnCount; i++) {
@@ -747,7 +890,19 @@ static void delayWithButtonPolling(uint32_t waitMs) {
     while (millis() - start < waitMs) {
         for (int i = 0; i < btnCount; i++) {
             bool pressed = (digitalRead(btnPins[i]) == LOW);
-            if (pressed && !prevState[i]) {
+            if (btnPins[i] == SLEEP_TOGGLE_BTN) {
+                // D11 uses long-press detection
+                if (pressed && !prevState[i]) {
+                    d11DownAt = millis();
+                    d11Held = false;
+                }
+                if (pressed && !d11Held && (millis() - d11DownAt >= SLEEP_TOGGLE_HOLD_MS)) {
+                    handleSleepToggle();
+                    d11Held = true;
+                    while (digitalRead(SLEEP_TOGGLE_BTN) == LOW) delay(20);
+                }
+                if (!pressed) d11Held = false;
+            } else if (pressed && !prevState[i]) {
                 // New press detected — debounce briefly then act
                 delay(40);
                 if (digitalRead(btnPins[i]) == LOW) {
@@ -769,12 +924,27 @@ static const char *displayModeName(uint8_t mode) {
         case DISPLAY_MODE_TEMP_ONLY: return "TEMP";
         case DISPLAY_MODE_RH_ONLY: return "HUMIDITY";
         case DISPLAY_MODE_TEMP_RH: return "TEMP_RH";
+        case DISPLAY_MODE_TEXT_ONLY: return "TEXT_ONLY";
         default: return "UNKNOWN";
     }
 }
 
 static void advanceDisplayMode() {
     currentDisplayMode = (uint8_t)((currentDisplayMode + 1) % DISPLAY_MODE_COUNT);
+}
+
+static void advanceDeepDisplayMode() {
+    currentDeepDisplayMode = (uint8_t)((currentDeepDisplayMode + 1) % DEEP_DISPLAY_MODE_COUNT);
+}
+
+static const char *displayModeNameDeep(uint8_t mode) {
+    switch (mode) {
+        case DEEP_DISPLAY_MODE_COMBINED: return "DEEP_COMBINED";
+        case DEEP_DISPLAY_MODE_CO2_ONLY: return "DEEP_CO2";
+        case DEEP_DISPLAY_MODE_TEMP_ONLY: return "DEEP_TEMP";
+        case DEEP_DISPLAY_MODE_RH_ONLY: return "DEEP_RH";
+        default: return "UNKNOWN";
+    }
 }
 
 static void handleModeCycleRequest() {
@@ -943,6 +1113,65 @@ static void carouselButtonTask(void *param) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// D11 sleep toggle button task: monitors for 2 s hold to toggle sleep mode.
+// Runs only in USB mode as a FreeRTOS task.
+// ---------------------------------------------------------------------------
+static void sleepToggleButtonTask(void *param) {
+    (void)param;
+    bool pressedPrev = false;
+    unsigned long downAt = 0;
+    bool holdFired = false;
+
+    while (true) {
+        bool pressed = (digitalRead(SLEEP_TOGGLE_BTN) == LOW);
+
+        if (pressed && !pressedPrev) {
+            downAt = millis();
+            holdFired = false;
+        }
+
+        if (pressed && !holdFired && (millis() - downAt >= SLEEP_TOGGLE_HOLD_MS)) {
+            handleSleepToggle();
+            holdFired = true;
+        }
+
+        if (!pressed && pressedPrev) {
+            holdFired = false;
+        }
+
+        pressedPrev = pressed;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// D15 stats button task: short press shows battery/config stats overlay.
+// Runs only in USB mode as a FreeRTOS task.
+// ---------------------------------------------------------------------------
+static void statsButtonTask(void *param) {
+    (void)param;
+    bool pressedPrev = false;
+    unsigned long downAt = 0;
+
+    while (true) {
+        bool pressed = (digitalRead(STATS_BTN) == LOW);
+
+        if (pressed && !pressedPrev) {
+            downAt = millis();
+        }
+
+        if (!pressed && pressedPrev) {
+            if (millis() - downAt >= 40) {
+                handleStatsButtonPress();
+            }
+        }
+
+        pressedPrev = pressed;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
 static void flashNeopixelsColor(uint8_t red, uint8_t green, uint8_t blue, uint16_t ms) {
     digitalWrite(NEOPIXEL_POWER, LOW);
     delay(10);
@@ -961,6 +1190,264 @@ static void flashNeopixelsColor(uint8_t red, uint8_t green, uint8_t blue, uint16
 // ---------------------------------------------------------------------------
 void flashNeopixelsRed() {
     flashNeopixelsColor(GENERIC_RED_FLASH_R, GENERIC_RED_FLASH_G, GENERIC_RED_FLASH_B, FLASH_DURATION_MS);
+}
+
+// ---------------------------------------------------------------------------
+// Flash only the two center neopixels (indices 1 and 2).
+// ---------------------------------------------------------------------------
+static void flashCenterNeopixels(uint8_t r, uint8_t g, uint8_t b, uint16_t ms) {
+    digitalWrite(NEOPIXEL_POWER, LOW);
+    delay(10);
+    pixels.clear();
+    pixels.setPixelColor(1, pixels.Color(r, g, b));
+    pixels.setPixelColor(2, pixels.Color(r, g, b));
+    pixels.show();
+    delay(ms);
+    pixels.clear();
+    pixels.show();
+    digitalWrite(NEOPIXEL_POWER, HIGH);
+}
+
+// ---------------------------------------------------------------------------
+// Show "Deep Sleep" / "On" or "Off" status screen, centered on display.
+// ---------------------------------------------------------------------------
+static void showSleepModeStatus() {
+    display.clearBuffer();
+    display.fillScreen(bgColor());
+    display.setTextColor(fgColor());
+    display.setTextWrap(false);
+
+    const char *line1 = "Deep Sleep";
+    const char *line2 = deepSleepEnabled ? "On" : "Off";
+
+    int16_t x1, y1;
+    uint16_t w1, h1, w2, h2;
+
+    display.setTextSize(2);
+    display.getTextBounds(line1, 0, 0, &x1, &y1, &w1, &h1);
+    display.getTextBounds(line2, 0, 0, &x1, &y1, &w2, &h2);
+
+    int16_t gap = 8;
+    int16_t totalH = (int16_t)h1 + gap + (int16_t)h2;
+    int16_t startY = (display.height() - totalH) / 2;
+
+    display.setCursor((display.width() - (int16_t)w1) / 2, startY);
+    display.print(line1);
+
+    display.setCursor((display.width() - (int16_t)w2) / 2, startY + (int16_t)h1 + gap);
+    display.print(line2);
+
+    display.display();
+}
+
+// ---------------------------------------------------------------------------
+// Format a duration in milliseconds as a human-readable interval string.
+// E.g. 15000 → "15s", 300000 → "5m", 3600000 → "1h".
+// ---------------------------------------------------------------------------
+static void formatDuration(uint32_t ms, char *buf, size_t bufLen) {
+    if (ms < 60000UL) {
+        snprintf(buf, bufLen, "%lus", (unsigned long)(ms / 1000UL));
+    } else if (ms < 3600000UL) {
+        uint32_t m = ms / 60000UL;
+        uint32_t s = (ms % 60000UL) / 1000UL;
+        if (s > 0) snprintf(buf, bufLen, "%lum%lus", (unsigned long)m, (unsigned long)s);
+        else       snprintf(buf, bufLen, "%lum", (unsigned long)m);
+    } else {
+        uint32_t h = ms / 3600000UL;
+        uint32_t m = (ms % 3600000UL) / 60000UL;
+        if (m > 0) snprintf(buf, bufLen, "%luh%lum", (unsigned long)h, (unsigned long)m);
+        else       snprintf(buf, bufLen, "%luh", (unsigned long)h);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Estimate remaining battery time based on current voltage/percent and
+// approximate average current draw for the active power mode.
+//
+// These are rough ballpark numbers for the MagTag with SCD30:
+//   USB mode (always-on):    ~80 mA average (CPU + sensor + display + USB)
+//   Light sleep (battery):   ~5 mA average  (mostly sleeping, brief wakes)
+//   Deep sleep (battery):    ~3 mA average  (mostly off, brief sample wakes)
+//
+// Battery capacity configured via BATTERY_CAPACITY_MAH define.
+// ---------------------------------------------------------------------------
+static void estimateRemainingTime(uint8_t battPct, char *buf, size_t bufLen) {
+    // Usable capacity (mAh) linearly scaled by battery percent
+    const float capacityMah = (float)BATTERY_CAPACITY_MAH;
+    float remainingMah = capacityMah * (battPct / 100.0f);
+
+    float avgCurrentMa;
+    if (usbPowerPresent) {
+        // On USB power — effectively unlimited, don't estimate
+        snprintf(buf, bufLen, "USB powered");
+        return;
+    } else if (deepSleepEnabled) {
+        avgCurrentMa = 3.0f;
+    } else {
+        avgCurrentMa = 5.0f;
+    }
+
+    float hoursLeft = remainingMah / avgCurrentMa;
+    uint32_t totalMinutes = (uint32_t)(hoursLeft * 60.0f);
+
+    if (totalMinutes >= 1440) {
+        uint32_t days = totalMinutes / 1440;
+        uint32_t hours = (totalMinutes % 1440) / 60;
+        snprintf(buf, bufLen, "~%lud %luh", (unsigned long)days, (unsigned long)hours);
+    } else if (totalMinutes >= 60) {
+        uint32_t hours = totalMinutes / 60;
+        uint32_t mins = totalMinutes % 60;
+        snprintf(buf, bufLen, "~%luh %lum", (unsigned long)hours, (unsigned long)mins);
+    } else {
+        snprintf(buf, bufLen, "~%lum", (unsigned long)totalMinutes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Show battery and system configuration stats on the e-ink display.
+// Called when D15 is pressed; displays for STATS_DISPLAY_MS then restores.
+// ---------------------------------------------------------------------------
+static void showStatsScreen() {
+    float battV = readBatteryVoltage();
+    uint8_t battPct = batteryPercentFromVoltage(battV);
+
+    char remainBuf[24];
+    estimateRemainingTime(battPct, remainBuf, sizeof(remainBuf));
+
+    // Format interval strings
+    char usbSample[16], usbDisplay[16];
+    char batSample[16], batDisplay[16];
+    char graphWin[16];
+
+    formatDuration(USB_SAMPLE_INTERVAL_MS, usbSample, sizeof(usbSample));
+    formatDuration(USB_DISPLAY_INTERVAL_MS, usbDisplay, sizeof(usbDisplay));
+    formatDuration(BATTERY_SAMPLE_INTERVAL_MS, batSample, sizeof(batSample));
+    formatDuration(BATTERY_DISPLAY_INTERVAL_MS, batDisplay, sizeof(batDisplay));
+    snprintf(graphWin, sizeof(graphWin), "%dm", GRAPH_WINDOW_MINUTES);
+
+    const char *sleepMode = usbPowerPresent ? "USB"
+                          : deepSleepEnabled ? "Deep"
+                          : "Light";
+
+    display.clearBuffer();
+    display.fillScreen(bgColor());
+    display.setTextColor(fgColor());
+    display.setTextWrap(false);
+
+    // ── Left column: battery info ──
+    int16_t x = SCREEN_PAD_LEFT + 4;
+    int16_t y = SCREEN_PAD_TOP + 2;
+
+    display.setTextSize(1);
+    display.setCursor(x, y);
+    display.print("BATTERY");
+    y += 14;
+
+    display.setTextSize(2);
+    char voltLine[24];
+    snprintf(voltLine, sizeof(voltLine), "%.2fV  %u%%", battV, battPct);
+    display.setCursor(x, y);
+    display.print(voltLine);
+    y += 22;
+
+    display.setTextSize(1);
+    display.setCursor(x, y);
+    display.printf("Remaining: %s", remainBuf);
+    y += 12;
+
+    display.setCursor(x, y);
+    display.printf("Capacity: %u mAh", (unsigned)BATTERY_CAPACITY_MAH);
+    y += 12;
+
+    display.setCursor(x, y);
+    display.printf("Mode: %s", sleepMode);
+    y += 18;
+
+    // ── Left column: configuration ──
+    display.setCursor(x, y);
+    display.print("CONFIG");
+    y += 14;
+
+    display.setCursor(x, y);
+    display.printf("Graph window: %s", graphWin);
+    y += 12;
+
+    display.setCursor(x, y);
+    display.printf("USB:  sample %s / disp %s", usbSample, usbDisplay);
+    y += 12;
+
+    display.setCursor(x, y);
+    display.printf("Batt: sample %s / disp %s", batSample, batDisplay);
+
+    display.display();
+}
+
+// ---------------------------------------------------------------------------
+// Handle a D15 stats button press: flash LED, show stats, wait, then
+// restore the previous display content.
+// ---------------------------------------------------------------------------
+static void handleStatsButtonPress() {
+    flashNeopixelsColor(STATS_FLASH_R, STATS_FLASH_G, STATS_FLASH_B, INVERT_FLASH_MS);
+    playModeToggleTone();
+
+    showStatsScreen();
+    delay(STATS_DISPLAY_MS);
+
+    // Restore previous display
+    if (hasReading) {
+        if (deepSleepEnabled && !usbPowerPresent) {
+            updateDisplayDeepSleep(lastCO2, lastTempF, lastRH);
+        } else {
+            updateDisplay(lastCO2, lastTempF, lastRH);
+        }
+        lastDisplayMs = millis();
+    } else {
+        showStatus("Waiting for data...");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Toggle deep/light sleep mode: flash LEDs, beep, show status, redraw.
+// ---------------------------------------------------------------------------
+static void handleSleepToggle() {
+    deepSleepEnabled = !deepSleepEnabled;
+    rtcDeepSleepEnabled = deepSleepEnabled;
+
+    Serial.printf("Sleep mode toggled: %s\n", deepSleepEnabled ? "DEEP" : "LIGHT");
+
+    // NeoPixel feedback
+    if (deepSleepEnabled) {
+        // Deep sleep ON: two center pixels flash dark blue
+        flashCenterNeopixels(DEEP_SLEEP_ON_FLASH_R, DEEP_SLEEP_ON_FLASH_G, DEEP_SLEEP_ON_FLASH_B, FLASH_DURATION_MS);
+    } else {
+        // Deep sleep OFF: all four pixels flash light blue
+        flashNeopixelsColor(DEEP_SLEEP_OFF_FLASH_R, DEEP_SLEEP_OFF_FLASH_G, DEEP_SLEEP_OFF_FLASH_B, FLASH_DURATION_MS);
+    }
+
+    // Audible feedback
+    playModeToggleTone();
+
+    // Reset display modes to defaults for the new sleep type
+    currentDisplayMode = DISPLAY_MODE_COMBINED;
+    currentDeepDisplayMode = DEEP_DISPLAY_MODE_COMBINED;
+
+    // Show status screen
+    showSleepModeStatus();
+    delay(2000);
+
+    // Redraw with current data in the appropriate mode.
+    // Always restore the display — if no readings yet, show a waiting message
+    // so the status screen doesn't persist on the e-ink.
+    if (hasReading) {
+        if (deepSleepEnabled && !usbPowerPresent) {
+            updateDisplayDeepSleep(lastCO2, lastTempF, lastRH);
+        } else {
+            updateDisplay(lastCO2, lastTempF, lastRH);
+        }
+        lastDisplayMs = millis();
+    } else {
+        showStatus("Waiting for data...");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,16 +1508,31 @@ static void drawGraph(const float *buf, int n,
         return gy + gh - 1 - (int16_t)(frac * (gh - 1)); // top = high
     };
 
-#if GRAPH_UNDERLINE_LIGHT_FILL
+#if GRAPH_FILL_MODE != 0
     auto fillUnderSegment = [&](int16_t x0, int16_t y0, int16_t x1, int16_t y1) {
-        const uint16_t shade = GRAPH_UNDERLINE_FILL_SHADE;
+        const uint16_t shade = GRAPH_FILL_SHADE;
         const int16_t graphRight = gx + gw - 1;
 
         if (x0 == x1) {
             if (x0 < gx || x0 > graphRight) return;
             if (y0 < gy) y0 = gy;
             if (y0 > graphBottom) y0 = graphBottom;
+#if GRAPH_FILL_MODE == 1
             display.drawLine(x0, y0, x0, graphBottom, shade);
+#elif GRAPH_FILL_MODE == 2
+            for (int16_t py = graphBottom - ((graphBottom - y0) & 1 ? 0 : 1); py >= y0; py -= 2) {
+                if ((x0 + (graphBottom - py)) & 1) display.drawPixel(x0, py, shade);
+            }
+#elif GRAPH_FILL_MODE == 3
+            if (((x0 - gx) % GRAPH_FILL_VLINE_SPACING) == 0)
+                display.drawLine(x0, y0, x0, graphBottom, shade);
+#elif GRAPH_FILL_MODE == 4
+            if (x0 & 1) {
+                for (int16_t py = graphBottom; py >= y0; py -= 2) {
+                    display.drawPixel(x0, py, shade);
+                }
+            }
+#endif
             return;
         }
 
@@ -1046,7 +1548,22 @@ static void drawGraph(const float *buf, int n,
             int16_t y = (int16_t)(y0 + (y1 - y0) * t);
             if (y < gy) y = gy;
             if (y > graphBottom) y = graphBottom;
+#if GRAPH_FILL_MODE == 1
             display.drawLine(x, y, x, graphBottom, shade);
+#elif GRAPH_FILL_MODE == 2
+            for (int16_t py = graphBottom; py >= y; --py) {
+                if ((x + (graphBottom - py)) & 1) display.drawPixel(x, py, shade);
+            }
+#elif GRAPH_FILL_MODE == 3
+            if (((x - gx) % GRAPH_FILL_VLINE_SPACING) == 0)
+                display.drawLine(x, y, x, graphBottom, shade);
+#elif GRAPH_FILL_MODE == 4
+            if (x & 1) {
+                for (int16_t py = graphBottom; py >= y; py -= 2) {
+                    display.drawPixel(x, py, shade);
+                }
+            }
+#endif
         }
     };
 #endif
@@ -1062,8 +1579,8 @@ static void drawGraph(const float *buf, int n,
         float v1 = histGet(buf, start + i);
         int16_t y0 = yForVal(v0);
         int16_t y1 = yForVal(v1);
-#if GRAPH_UNDERLINE_LIGHT_FILL
-    #if GRAPH_UNDERLINE_FILL_RISING_ONLY
+#if GRAPH_FILL_MODE != 0
+    #if GRAPH_FILL_RISING_ONLY
         if (v1 > v0) {
             fillUnderSegment(x0, y0, x1, y1);
         }
@@ -1235,7 +1752,7 @@ void updateDisplay(float co2, float tempF, float rh) {
         printRightAligned(textRight, yLow, buf);
 
         drawGraph(metricBuf, n, graphX, contentTop + 2, graphW, contentH - 4);
-    } else {
+    } else if (currentDisplayMode == DISPLAY_MODE_TEMP_RH) {
         int16_t textRight = contentLeft + TEXT_RIGHT_GRAPH_HEAVY;
         int16_t graphX = contentLeft + GRAPH_X_GRAPH_HEAVY;
         int16_t graphW = contentRight - graphX + 1;
@@ -1254,6 +1771,164 @@ void updateDisplay(float co2, float tempF, float rh) {
 
         drawGraph(histTempF, n, graphX, upperY, graphW, halfH);
         drawGraph(histRH,    n, graphX, lowerY, graphW, halfH);
+    } else {
+        // DISPLAY_MODE_TEXT_ONLY: CO2 left half, temp+RH right half (no graphs)
+        int16_t screenW = display.width();
+        int16_t screenH = display.height();
+        int16_t halfW = screenW / 2;
+
+        // Left half: CO2 + "ppm"
+        display.setTextSize(3);
+        snprintf(buf, sizeof(buf), "%d", (int)co2);
+        int16_t bx, by; uint16_t bw, bh;
+        display.getTextBounds(buf, 0, 0, &bx, &by, &bw, &bh);
+        uint16_t co2NumW = bw, co2NumH = bh;
+
+        display.setTextSize(2);
+        uint16_t ppmW, ppmH;
+        display.getTextBounds("ppm", 0, 0, &bx, &by, &ppmW, &ppmH);
+
+        int16_t gap = 4;
+        int16_t totalCO2H = (int16_t)co2NumH + gap + (int16_t)ppmH;
+        int16_t co2StartY = (screenH - totalCO2H) / 2;
+
+        display.setTextSize(3);
+        display.setCursor((halfW - (int16_t)co2NumW) / 2, co2StartY);
+        display.print(buf);
+
+        display.setTextSize(2);
+        display.setCursor((halfW - (int16_t)ppmW) / 2, co2StartY + (int16_t)co2NumH + gap);
+        display.print("ppm");
+
+        // Right half: temp + humidity
+        display.setTextSize(2);
+        snprintf(buf, sizeof(buf), "%.1f F", tempF);
+        display.getTextBounds(buf, 0, 0, &bx, &by, &bw, &bh);
+        uint16_t tempW = bw, tempH = bh;
+
+        char rhBuf[32];
+        snprintf(rhBuf, sizeof(rhBuf), "%.1f %%", rh);
+        uint16_t rhW, rhH;
+        display.getTextBounds(rhBuf, 0, 0, &bx, &by, &rhW, &rhH);
+
+        uint16_t maxW = (tempW > rhW) ? tempW : rhW;
+        int16_t rightGap = 8;
+        int16_t totalRightH = (int16_t)tempH + rightGap + (int16_t)rhH;
+        int16_t rightStartY = (screenH - totalRightH) / 2;
+        int16_t rightStartX = halfW + (halfW - (int16_t)maxW) / 2;
+
+        display.setCursor(rightStartX, rightStartY);
+        display.print(buf);
+        display.setCursor(rightStartX, rightStartY + (int16_t)tempH + rightGap);
+        display.print(rhBuf);
+    }
+
+    display.display();
+    flashPendingBatteryTierIfAny();
+}
+
+// ---------------------------------------------------------------------------
+// Redraw the e-ink display in deep-sleep compact modes (no graphs).
+//   Combined: CO2+ppm on left half, temp+RH on right half.
+//   Single:   One metric centered with suffix below.
+// ---------------------------------------------------------------------------
+void updateDisplayDeepSleep(float co2, float tempF, float rh) {
+    uint16_t fg = fgColor();
+    display.clearBuffer();
+    display.fillScreen(bgColor());
+    display.setTextColor(fg);
+    display.setTextWrap(false);
+
+    char buf[32];
+    int16_t x1, y1;
+    uint16_t w, h;
+    int16_t screenW = display.width();
+    int16_t screenH = display.height();
+
+    if (currentDeepDisplayMode == DEEP_DISPLAY_MODE_COMBINED) {
+        // ── Left half: CO2 number + "ppm" suffix, centered ──
+        int16_t halfW = screenW / 2;
+
+        display.setTextSize(3);
+        snprintf(buf, sizeof(buf), "%d", (int)co2);
+        display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+        uint16_t co2NumW = w, co2NumH = h;
+
+        display.setTextSize(2);
+        uint16_t ppmW, ppmH;
+        display.getTextBounds("ppm", 0, 0, &x1, &y1, &ppmW, &ppmH);
+
+        int16_t gap = 4;
+        int16_t totalCO2H = (int16_t)co2NumH + gap + (int16_t)ppmH;
+        int16_t co2StartY = (screenH - totalCO2H) / 2;
+
+        display.setTextSize(3);
+        display.setCursor((halfW - (int16_t)co2NumW) / 2, co2StartY);
+        display.print(buf);
+
+        display.setTextSize(2);
+        display.setCursor((halfW - (int16_t)ppmW) / 2, co2StartY + (int16_t)co2NumH + gap);
+        display.print("ppm");
+
+        // ── Right half: temp + humidity, left-aligned group centered ──
+        display.setTextSize(2);
+        snprintf(buf, sizeof(buf), "%.1f F", tempF);
+        display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+        uint16_t tempW = w, tempH = h;
+
+        char rhBuf[32];
+        snprintf(rhBuf, sizeof(rhBuf), "%.1f %%", rh);
+        uint16_t rhW, rhH;
+        display.getTextBounds(rhBuf, 0, 0, &x1, &y1, &rhW, &rhH);
+
+        uint16_t maxW = (tempW > rhW) ? tempW : rhW;
+        int16_t rightGap = 8;
+        int16_t totalRightH = (int16_t)tempH + rightGap + (int16_t)rhH;
+        int16_t rightStartY = (screenH - totalRightH) / 2;
+        int16_t rightStartX = halfW + (halfW - (int16_t)maxW) / 2;
+
+        display.setCursor(rightStartX, rightStartY);
+        display.print(buf);
+
+        display.setCursor(rightStartX, rightStartY + (int16_t)tempH + rightGap);
+        display.print(rhBuf);
+
+    } else {
+        // ── Single metric centered with suffix below ──
+        float val;
+        const char *suffix;
+        int decimals;
+
+        if (currentDeepDisplayMode == DEEP_DISPLAY_MODE_CO2_ONLY) {
+            val = co2; suffix = "ppm"; decimals = 0;
+        } else if (currentDeepDisplayMode == DEEP_DISPLAY_MODE_TEMP_ONLY) {
+            val = tempF; suffix = "F"; decimals = 1;
+        } else {
+            val = rh; suffix = "%"; decimals = 1;
+        }
+
+        if (decimals == 0) snprintf(buf, sizeof(buf), "%d", (int)val);
+        else                snprintf(buf, sizeof(buf), "%.1f", val);
+
+        display.setTextSize(3);
+        display.getTextBounds(buf, 0, 0, &x1, &y1, &w, &h);
+        uint16_t numW = w, numH = h;
+
+        display.setTextSize(2);
+        uint16_t sfxW, sfxH;
+        display.getTextBounds(suffix, 0, 0, &x1, &y1, &sfxW, &sfxH);
+
+        int16_t gap = 4;
+        int16_t totalH = (int16_t)numH + gap + (int16_t)sfxH;
+        int16_t startY = (screenH - totalH) / 2;
+
+        display.setTextSize(3);
+        display.setCursor((screenW - (int16_t)numW) / 2, startY);
+        display.print(buf);
+
+        display.setTextSize(2);
+        display.setCursor((screenW - (int16_t)sfxW) / 2, startY + (int16_t)numH + gap);
+        display.print(suffix);
     }
 
     display.display();
@@ -1339,6 +2014,8 @@ void setup() {
     // Configure button GPIOs and sample state immediately
     pinMode(MODE_BTN, INPUT_PULLUP);
     pinMode(CAROUSEL_BTN, INPUT_PULLUP);
+    pinMode(SLEEP_TOGGLE_BTN, INPUT_PULLUP);
+    pinMode(STATS_BTN, INPUT_PULLUP);
 
     // Detect which button caused wake from the ext1 status register,
     // then immediately verify the pin is still LOW to filter noise.
@@ -1347,8 +2024,10 @@ void setup() {
     buttonWakeGPIO = 0;
     if (wakeCause == ESP_SLEEP_WAKEUP_EXT1) {
         uint64_t wakeStatus = esp_sleep_get_ext1_wakeup_status();
-        if (wakeStatus & (1ULL << MODE_BTN))        buttonWakeGPIO = MODE_BTN;
-        else if (wakeStatus & (1ULL << CAROUSEL_BTN)) buttonWakeGPIO = CAROUSEL_BTN;
+        if (wakeStatus & (1ULL << SLEEP_TOGGLE_BTN))  buttonWakeGPIO = SLEEP_TOGGLE_BTN;
+        else if (wakeStatus & (1ULL << MODE_BTN))      buttonWakeGPIO = MODE_BTN;
+        else if (wakeStatus & (1ULL << CAROUSEL_BTN))  buttonWakeGPIO = CAROUSEL_BTN;
+        else if (wakeStatus & (1ULL << STATS_BTN))     buttonWakeGPIO = STATS_BTN;
 
         // Immediate pin check — no delay, just verify the button is actually held
         if (buttonWakeGPIO != 0 && digitalRead(buttonWakeGPIO) != LOW) {
@@ -1358,12 +2037,14 @@ void setup() {
 
     // Restore RTC-persisted state immediately (no NVS needed)
     if (wokeFromDeepSleep) {
-        currentDisplayMode  = rtcDisplayMode;
-        carouselModeEnabled = rtcCarouselEnabled;
-        lastCO2             = rtcLastCO2;
-        lastTempF           = rtcLastTempF;
-        lastRH              = rtcLastRH;
-        hasReading          = rtcHasReading;
+        currentDisplayMode      = rtcDisplayMode;
+        carouselModeEnabled     = rtcCarouselEnabled;
+        lastCO2                 = rtcLastCO2;
+        lastTempF               = rtcLastTempF;
+        lastRH                  = rtcLastRH;
+        hasReading              = rtcHasReading;
+        deepSleepEnabled        = rtcDeepSleepEnabled;
+        currentDeepDisplayMode  = rtcDeepDisplayMode;
     }
 
     // Now safe to start serial (short delay for deep sleep wake)
@@ -1409,11 +2090,12 @@ void setup() {
 
     // Button GPIOs already configured above (before ext1 debounce)
 
-    // ── LIS3DH accelerometer (on-board) ──
+    // ── LIS3DH accelerometer (on-board) — unused, power down immediately ──
     if (!lis.begin(0x19)) {
         Serial.println("WARNING: LIS3DH not found");
     } else {
-        Serial.println("LIS3DH initialised");
+        lis.setDataRate(LIS3DH_DATARATE_POWERDOWN);
+        Serial.println("LIS3DH powered down (unused)");
     }
 
     // ── E-ink display ──
@@ -1474,8 +2156,30 @@ void setup() {
     // Button polling tasks are only useful in USB mode where we stay awake.
     // In battery mode, buttons wake the device via ext1 interrupt instead.
     if (usbPowerPresent) {
-        xTaskCreate(modeButtonTask, "mode_btn", 8192, nullptr, 1, nullptr);
-        xTaskCreate(carouselButtonTask, "carousel_btn", 8192, nullptr, 1, nullptr);
+        xTaskCreate(modeButtonTask, "mode_btn", 8192, nullptr, 1, &modeButtonTaskHandle);
+        xTaskCreate(carouselButtonTask, "carousel_btn", 8192, nullptr, 1, &carouselButtonTaskHandle);
+        xTaskCreate(sleepToggleButtonTask, "sleep_btn", 8192, nullptr, 1, &sleepToggleTaskHandle);
+        xTaskCreate(statsButtonTask, "stats_btn", 8192, nullptr, 1, &statsButtonTaskHandle);
+    }
+
+    // ── Handle D11 (sleep toggle) wake from deep sleep ──
+    // Must happen after display + neopixel init but before SCD30 init,
+    // so the toggle result can influence whether SCD30 is needed.
+    if (wokeFromDeepSleep && buttonWakeGPIO == SLEEP_TOGGLE_BTN) {
+        // Check for 2 s hold to toggle sleep mode
+        unsigned long holdStart = millis();
+        bool toggled = false;
+        while (digitalRead(SLEEP_TOGGLE_BTN) == LOW) {
+            if (millis() - holdStart >= SLEEP_TOGGLE_HOLD_MS) {
+                handleSleepToggle();
+                toggled = true;
+                while (digitalRead(SLEEP_TOGGLE_BTN) == LOW) delay(20);
+                break;
+            }
+            delay(20);
+        }
+        buttonWakeGPIO = 0;  // consumed
+        Serial.printf("D11 wake: %s\n", toggled ? "toggled sleep mode" : "released early");
     }
 
     if (!wokeFromDeepSleep) {
@@ -1485,9 +2189,9 @@ void setup() {
     // ── I2C + SCD-30 sensor ──
     Wire.begin(SDA, SCL);
 
-    // In battery mode, only start the SCD30 when it's actually sample time.
-    // This avoids wasting power on warm-up during poll-only/button wakes.
-    bool needScd30 = usbPowerPresent || !wokeFromDeepSleep
+    // In battery deep-sleep mode, only start the SCD30 when it's actually
+    // sample time.  In light-sleep mode or USB, always start it.
+    bool needScd30 = usbPowerPresent || !wokeFromDeepSleep || !deepSleepEnabled
                      || batterySampleElapsedMs >= BATTERY_SAMPLE_INTERVAL_MS;
 
     if (needScd30) {
@@ -1527,7 +2231,34 @@ void loop() {
             resetBatteryTierNotificationsForUsb();
             flashNeopixelsColor(USB_CONNECTED_FLASH_R, USB_CONNECTED_FLASH_G, USB_CONNECTED_FLASH_B, 180);
             playUsbConnectedJingle();
+
+            // Recreate button tasks for USB mode (if not already running)
+            if (modeButtonTaskHandle == nullptr)
+                xTaskCreate(modeButtonTask, "mode_btn", 8192, nullptr, 1, &modeButtonTaskHandle);
+            if (carouselButtonTaskHandle == nullptr)
+                xTaskCreate(carouselButtonTask, "carousel_btn", 8192, nullptr, 1, &carouselButtonTaskHandle);
+            if (sleepToggleTaskHandle == nullptr)
+                xTaskCreate(sleepToggleButtonTask, "sleep_btn", 8192, nullptr, 1, &sleepToggleTaskHandle);
+            if (statsButtonTaskHandle == nullptr)
+                xTaskCreate(statsButtonTask, "stats_btn", 8192, nullptr, 1, &statsButtonTaskHandle);
         } else {
+            // Delete USB button tasks — battery mode uses ext1 wake instead
+            if (modeButtonTaskHandle != nullptr) {
+                vTaskDelete(modeButtonTaskHandle);
+                modeButtonTaskHandle = nullptr;
+            }
+            if (carouselButtonTaskHandle != nullptr) {
+                vTaskDelete(carouselButtonTaskHandle);
+                carouselButtonTaskHandle = nullptr;
+            }
+            if (sleepToggleTaskHandle != nullptr) {
+                vTaskDelete(sleepToggleTaskHandle);
+                sleepToggleTaskHandle = nullptr;
+            }
+            if (statsButtonTaskHandle != nullptr) {
+                vTaskDelete(statsButtonTaskHandle);
+                statsButtonTaskHandle = nullptr;
+            }
             handleBatteryTierTransition(battPctNow);
             flashBatteryLedTier(batteryLedTierFromPercent(battPctNow), 1, BATTERY_LEVEL_FLASH_ON_MS, BATTERY_LEVEL_FLASH_OFF_MS);
             playUsbDisconnectedJingle();
@@ -1535,141 +2266,273 @@ void loop() {
     }
 
     if (!usbPowerPresent) {
-        const uint32_t sleepPollMs = BATTERY_USB_POLL_INTERVAL_MS;
-
         float battV = readBatteryVoltage();
-
-        // Handle button wake: apply the pressed button's action
-        if (buttonWakeGPIO != 0) {
-            applyButtonAction(buttonWakeGPIO);
-            buttonWakeGPIO = 0;
-        }
         uint8_t battPct = batteryPercentFromVoltage(battV);
         handleBatteryTierTransition(battPct);
 
-        bool showWarn50 = false;
-        bool showCriticalWarn = false;
+        if (deepSleepEnabled) {
+            // =================================================================
+            // DEEP SLEEP BATTERY PATH — compact display, no graph samples
+            // =================================================================
+            const uint32_t sleepPollMs = BATTERY_USB_POLL_INTERVAL_MS;
 
-        if (battPct <= BATTERY_CRITICAL_PERCENT) {
-            uint32_t newElapsed = batteryCriticalElapsedMs + sleepPollMs;
-            if (newElapsed < batteryCriticalElapsedMs) newElapsed = BATTERY_CRITICAL_INTERVAL_MS;
-            batteryCriticalElapsedMs = newElapsed;
+            // Handle button wake: mode/carousel apply immediately
+            if (buttonWakeGPIO != 0 && buttonWakeGPIO != SLEEP_TOGGLE_BTN) {
+                applyButtonAction(buttonWakeGPIO);
+                buttonWakeGPIO = 0;
+            } else {
+                buttonWakeGPIO = 0;
+            }
 
-            if (batteryCriticalElapsedMs >= BATTERY_CRITICAL_INTERVAL_MS) {
-                showCriticalWarn = true;
+            // ── Battery warnings ──
+            bool showWarn50 = false;
+            bool showCriticalWarn = false;
+
+            if (battPct <= BATTERY_CRITICAL_PERCENT) {
+                uint32_t newElapsed = batteryCriticalElapsedMs + sleepPollMs;
+                if (newElapsed < batteryCriticalElapsedMs) newElapsed = BATTERY_CRITICAL_INTERVAL_MS;
+                batteryCriticalElapsedMs = newElapsed;
+                if (batteryCriticalElapsedMs >= BATTERY_CRITICAL_INTERVAL_MS) {
+                    showCriticalWarn = true;
+                    batteryCriticalElapsedMs = 0;
+                }
+            } else {
                 batteryCriticalElapsedMs = 0;
             }
-        } else {
-            batteryCriticalElapsedMs = 0;
-        }
 
-        if (battPct <= BATTERY_WARN_50_PERCENT && battPct > BATTERY_CRITICAL_PERCENT) {
-            if (!batteryWarn50Shown) {
-                showWarn50 = true;
-                batteryWarn50Shown = true;
-            }
-        } else {
-            if (battPct > BATTERY_WARN_50_PERCENT) {
+            if (battPct <= BATTERY_WARN_50_PERCENT && battPct > BATTERY_CRITICAL_PERCENT) {
+                if (!batteryWarn50Shown) { showWarn50 = true; batteryWarn50Shown = true; }
+            } else if (battPct > BATTERY_WARN_50_PERCENT) {
                 batteryWarn50Shown = false;
             }
-        }
 
-        if (showCriticalWarn) {
-            Serial.printf("Critical battery warning: %.2fV (%u%%)\n", battV, battPct);
-            showBatteryWarningMessage("Battery is at 10%,", "please recharge!", BATTERY_CRITICAL_DURATION_MS, true);
-        } else if (showWarn50) {
-            Serial.printf("Battery 50%% warning: %.2fV (%u%%)\n", battV, battPct);
-            showBatteryWarningMessage("Battery at 50%", "", BATTERY_WARN_50_DURATION_MS, false);
-        }
-
-        if (batterySampleElapsedMs < BATTERY_SAMPLE_INTERVAL_MS) {
-            batterySampleElapsedMs += sleepPollMs;
-            if (batterySampleElapsedMs > BATTERY_SAMPLE_INTERVAL_MS) {
-                batterySampleElapsedMs = BATTERY_SAMPLE_INTERVAL_MS;
+            if (showCriticalWarn) {
+                Serial.printf("Critical battery warning: %.2fV (%u%%)\n", battV, battPct);
+                showBatteryWarningMessage("Battery is at 10%,", "please recharge!", BATTERY_CRITICAL_DURATION_MS, true);
+            } else if (showWarn50) {
+                Serial.printf("Battery 50%% warning: %.2fV (%u%%)\n", battV, battPct);
+                showBatteryWarningMessage("Battery at 50%", "", BATTERY_WARN_50_DURATION_MS, false);
             }
 
-            enterDeepSleepMs(sleepPollMs);
-            return;
-        }
-
-        batterySampleElapsedMs = 0;
-
-        bool sampled = false;
-
-        // Safety: if SCD30 wasn't started (shouldn't happen), go back to sleep
-        if (!scd30Ready) {
-            Serial.println("SCD30 not ready at sample time – sleeping");
-            enterDeepSleepMs(sleepPollMs);
-            return;
-        }
-
-        unsigned long waitStart = millis();
-        while (!scd30.dataReady()) {
-            if (millis() - waitStart > 5000) {
-                Serial.println("Timeout waiting for SCD-30 data");
-                break;
+            // ── Sample timing (poll-only wakes don't read sensor) ──
+            if (batterySampleElapsedMs < BATTERY_SAMPLE_INTERVAL_MS) {
+                batterySampleElapsedMs += sleepPollMs;
+                if (batterySampleElapsedMs > BATTERY_SAMPLE_INTERVAL_MS)
+                    batterySampleElapsedMs = BATTERY_SAMPLE_INTERVAL_MS;
+                enterDeepSleepMs(sleepPollMs);
+                return;
             }
-            // Poll buttons while waiting for sensor data
-            for (uint8_t pin : {MODE_BTN, CAROUSEL_BTN}) {
-                if (digitalRead(pin) == LOW) {
-                    delay(40);
+            batterySampleElapsedMs = 0;
+
+            if (!scd30Ready) {
+                Serial.println("SCD30 not ready at sample time – sleeping");
+                enterDeepSleepMs(sleepPollMs);
+                return;
+            }
+
+            // Wait for sensor data, poll buttons
+            unsigned long waitStart = millis();
+            while (!scd30.dataReady()) {
+                if (millis() - waitStart > 5000) {
+                    Serial.println("Timeout waiting for SCD-30 data");
+                    break;
+                }
+                for (uint8_t pin : {MODE_BTN, CAROUSEL_BTN, STATS_BTN}) {
                     if (digitalRead(pin) == LOW) {
-                        applyButtonAction(pin);
-                        while (digitalRead(pin) == LOW) delay(20);
+                        delay(40);
+                        if (digitalRead(pin) == LOW) {
+                            applyButtonAction(pin);
+                            while (digitalRead(pin) == LOW) delay(20);
+                        }
                     }
                 }
+                delay(50);
             }
-            delay(50);
-        }
 
-        if (scd30.read()) {
-            float co2   = scd30.CO2;
-            float tempC = scd30.temperature;
-            float tempF = tempC * 9.0f / 5.0f + 32.0f;
-            float rh    = scd30.relative_humidity;
+            if (scd30.read()) {
+                float co2   = scd30.CO2;
+                float tempC = scd30.temperature;
+                float tempF = tempC * 9.0f / 5.0f + 32.0f;
+                float rh    = scd30.relative_humidity;
 
-            if (co2 <= 0.0f) {
-                Serial.println("Ignoring invalid CO2 reading (0 ppm)");
+                if (co2 > 0.0f) {
+                    Serial.printf("CO2: %.0f ppm | Temp: %.1f F | RH: %.1f %% | Batt: %.2fV (%u%%)\n",
+                                   co2, tempF, rh, battV, battPct);
+
+                    // Deep sleep: do NOT push graph samples (preserves NVS longevity)
+                    bool firstBatteryDisplay = (batterySampleCycles == 0);
+                    batterySampleCycles++;
+                    bool periodicDisplay = ((batterySampleCycles % BATTERY_DISPLAY_EVERY_N) == 0);
+
+                    lastCO2 = co2; lastTempF = tempF; lastRH = rh;
+                    hasReading = true;
+
+                    if (firstBatteryDisplay || periodicDisplay) {
+                        updateDisplayDeepSleep(co2, tempF, rh);
+                        lastDisplayMs = millis();
+                        if (carouselModeEnabled) advanceDeepDisplayMode();
+                    }
+                }
             } else {
-                Serial.printf("CO2: %.0f ppm | Temp: %.1f F | RH: %.1f %% | Batt: %.2fV (%u%%)\n",
-                               co2, tempF, rh, battV, battPct);
+                Serial.println("Failed to read SCD-30");
+            }
 
-                portENTER_CRITICAL(&stateMux);
-                displayUpdateInProgress = true;
-                portEXIT_CRITICAL(&stateMux);
+            enterDeepSleepMs(sleepPollMs);
+            return;
 
-                pushSample(co2, tempF, rh);
-                bool firstBatteryDisplay = (batterySampleCycles == 0);
-                batterySampleCycles++;
-                bool periodicDisplay = ((batterySampleCycles % BATTERY_DISPLAY_EVERY_N) == 0);
+        } else {
+            // =================================================================
+            // LIGHT SLEEP BATTERY PATH — full display with graphs, RAM preserved
+            // =================================================================
 
-                lastCO2 = co2;
-                lastTempF = tempF;
-                lastRH = rh;
-                hasReading = true;
+            // Handle button input after light sleep wake.
+            // Poll GPIO states directly rather than relying on
+            // esp_sleep_get_ext1_wakeup_status() which can be unreliable
+            // after light sleep on ESP32-S2 (timer wakes can mask the
+            // ext1 cause, and the status register may not populate).
+            if (lightSleepWakePending) {
+                lightSleepWakePending = false;
 
-                if (firstBatteryDisplay || periodicDisplay) {
-                    updateDisplay(co2, tempF, rh);
-                    lastDisplayMs = millis();
-                    if (carouselModeEnabled) {
-                        advanceDisplayMode();
+                // D11 sleep toggle: requires 2 s hold, so must still be LOW
+                if (digitalRead(SLEEP_TOGGLE_BTN) == LOW) {
+                    unsigned long holdStart = millis();
+                    bool toggled = false;
+                    while (digitalRead(SLEEP_TOGGLE_BTN) == LOW) {
+                        if (millis() - holdStart >= SLEEP_TOGGLE_HOLD_MS) {
+                            handleSleepToggle();
+                            toggled = true;
+                            while (digitalRead(SLEEP_TOGGLE_BTN) == LOW) delay(20);
+                            break;
+                        }
+                        delay(20);
+                    }
+                    if (toggled && deepSleepEnabled) {
+                        enterDeepSleepMs(BATTERY_USB_POLL_INTERVAL_MS);
+                        return;
                     }
                 }
-
-                portENTER_CRITICAL(&stateMux);
-                displayUpdateInProgress = false;
-                portEXIT_CRITICAL(&stateMux);
-
-                applyPendingModeCycleIfAny();
-                applyPendingCarouselToggleIfAny();
-                sampled = true;
+                // MODE / CAROUSEL: check GPIO first (button still held),
+                // then fall back to ext1 status (quick press-and-release).
+                else if (digitalRead(MODE_BTN) == LOW) {
+                    while (digitalRead(MODE_BTN) == LOW) delay(20);
+                    delay(50);
+                    applyButtonAction(MODE_BTN);
+                } else if (digitalRead(CAROUSEL_BTN) == LOW) {
+                    while (digitalRead(CAROUSEL_BTN) == LOW) delay(20);
+                    delay(50);
+                    applyButtonAction(CAROUSEL_BTN);
+                } else if (digitalRead(STATS_BTN) == LOW) {
+                    while (digitalRead(STATS_BTN) == LOW) delay(20);
+                    delay(50);
+                    applyButtonAction(STATS_BTN);
+                } else {
+                    // Button already released — use ext1 status as fallback
+                    esp_sleep_wakeup_cause_t lightWake = esp_sleep_get_wakeup_cause();
+                    if (lightWake == ESP_SLEEP_WAKEUP_EXT1) {
+                        uint64_t ws = esp_sleep_get_ext1_wakeup_status();
+                        // D11 released = ignore (requires hold); only handle short-press buttons
+                        if (ws & (1ULL << MODE_BTN)) {
+                            delay(50);
+                            applyButtonAction(MODE_BTN);
+                        } else if (ws & (1ULL << CAROUSEL_BTN)) {
+                            delay(50);
+                            applyButtonAction(CAROUSEL_BTN);
+                        } else if (ws & (1ULL << STATS_BTN)) {
+                            delay(50);
+                            applyButtonAction(STATS_BTN);
+                        }
+                    }
+                }
             }
-        } else {
-            Serial.println("Failed to read SCD-30");
-        }
 
-        enterDeepSleepMs(sleepPollMs);
-        return;
+            // Also handle residual button wake from deep→light transition
+            if (buttonWakeGPIO != 0 && buttonWakeGPIO != SLEEP_TOGGLE_BTN) {
+                applyButtonAction(buttonWakeGPIO);
+                buttonWakeGPIO = 0;
+            } else {
+                buttonWakeGPIO = 0;
+            }
+
+            // ── Battery warnings (millis-based, works across light sleep) ──
+            static unsigned long lastCriticalWarnMs = 0;
+            bool showWarn50 = false;
+            bool showCriticalWarn = false;
+
+            if (battPct <= BATTERY_CRITICAL_PERCENT) {
+                if (lastCriticalWarnMs == 0 || now - lastCriticalWarnMs >= BATTERY_CRITICAL_INTERVAL_MS) {
+                    showCriticalWarn = true;
+                    lastCriticalWarnMs = now;
+                }
+            } else {
+                lastCriticalWarnMs = 0;
+            }
+
+            if (battPct <= BATTERY_WARN_50_PERCENT && battPct > BATTERY_CRITICAL_PERCENT) {
+                if (!batteryWarn50Shown) { showWarn50 = true; batteryWarn50Shown = true; }
+            } else if (battPct > BATTERY_WARN_50_PERCENT) {
+                batteryWarn50Shown = false;
+            }
+
+            if (showCriticalWarn) {
+                Serial.printf("Critical battery warning: %.2fV (%u%%)\n", battV, battPct);
+                showBatteryWarningMessage("Battery is at 10%,", "please recharge!", BATTERY_CRITICAL_DURATION_MS, true);
+            } else if (showWarn50) {
+                Serial.printf("Battery 50%% warning: %.2fV (%u%%)\n", battV, battPct);
+                showBatteryWarningMessage("Battery at 50%", "", BATTERY_WARN_50_DURATION_MS, false);
+            }
+
+            // ── Sample + display on schedule (millis survives light sleep) ──
+            if (now - lastSampleMs >= BATTERY_SAMPLE_INTERVAL_MS) {
+                lastSampleMs = now;
+
+                if (scd30Ready) {
+                    unsigned long waitStart = millis();
+                    while (!scd30.dataReady()) {
+                        if (millis() - waitStart > 5000) {
+                            Serial.println("Timeout waiting for SCD-30 data");
+                            break;
+                        }
+                        delay(50);
+                    }
+
+                    if (scd30.read()) {
+                        float co2   = scd30.CO2;
+                        float tempC = scd30.temperature;
+                        float tempF = tempC * 9.0f / 5.0f + 32.0f;
+                        float rh    = scd30.relative_humidity;
+
+                        if (co2 > 0.0f) {
+                            Serial.printf("CO2: %.0f ppm | Temp: %.1f F | RH: %.1f %% | Batt: %.2fV (%u%%)\n",
+                                           co2, tempF, rh, battV, battPct);
+
+                            pushSample(co2, tempF, rh);
+                            lastCO2 = co2; lastTempF = tempF; lastRH = rh;
+                            hasReading = true;
+
+                            bool firstDisplay = (lastDisplayMs == 0);
+                            if (firstDisplay || now - lastDisplayMs >= BATTERY_DISPLAY_INTERVAL_MS) {
+                                updateDisplay(co2, tempF, rh);
+                                lastDisplayMs = millis();
+                                if (carouselModeEnabled) advanceDisplayMode();
+                            }
+                        }
+                    } else {
+                        Serial.println("Failed to read SCD-30");
+                    }
+                }
+            }
+
+            // ── Light sleep until next event ──
+            uint32_t elapsed = millis() - lastSampleMs;
+            uint32_t remaining = (elapsed < BATTERY_SAMPLE_INTERVAL_MS)
+                                 ? (BATTERY_SAMPLE_INTERVAL_MS - elapsed) : 0;
+            uint32_t sleepFor = remaining;
+            if (sleepFor > BATTERY_USB_POLL_INTERVAL_MS) sleepFor = BATTERY_USB_POLL_INTERVAL_MS;
+            if (sleepFor < 1000) sleepFor = 1000;
+
+            enterLightSleepMs(sleepFor);
+            return;
+        }
     }
 
     uint32_t sampleIntervalMs = currentSampleIntervalMs();
