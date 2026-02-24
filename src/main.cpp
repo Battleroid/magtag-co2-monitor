@@ -1296,15 +1296,15 @@ static void drawGraph(const float *buf, int n,
 #if GRAPH_FILL_MODE == 1
             display.drawLine(x0, y0, x0, graphBottom, shade);
 #elif GRAPH_FILL_MODE == 2
-            for (int16_t py = y0; py <= graphBottom; ++py) {
-                if ((x0 + py) & 1) display.drawPixel(x0, py, shade);
+            for (int16_t py = graphBottom - ((graphBottom - y0) & 1 ? 0 : 1); py >= y0; py -= 2) {
+                if ((x0 + (graphBottom - py)) & 1) display.drawPixel(x0, py, shade);
             }
 #elif GRAPH_FILL_MODE == 3
             if (((x0 - gx) % GRAPH_FILL_VLINE_SPACING) == 0)
                 display.drawLine(x0, y0, x0, graphBottom, shade);
 #elif GRAPH_FILL_MODE == 4
             if (x0 & 1) {
-                for (int16_t py = y0; py <= graphBottom; py += 2) {
+                for (int16_t py = graphBottom; py >= y0; py -= 2) {
                     display.drawPixel(x0, py, shade);
                 }
             }
@@ -1327,15 +1327,15 @@ static void drawGraph(const float *buf, int n,
 #if GRAPH_FILL_MODE == 1
             display.drawLine(x, y, x, graphBottom, shade);
 #elif GRAPH_FILL_MODE == 2
-            for (int16_t py = y; py <= graphBottom; ++py) {
-                if ((x + py) & 1) display.drawPixel(x, py, shade);
+            for (int16_t py = graphBottom; py >= y; --py) {
+                if ((x + (graphBottom - py)) & 1) display.drawPixel(x, py, shade);
             }
 #elif GRAPH_FILL_MODE == 3
             if (((x - gx) % GRAPH_FILL_VLINE_SPACING) == 0)
                 display.drawLine(x, y, x, graphBottom, shade);
 #elif GRAPH_FILL_MODE == 4
             if (x & 1) {
-                for (int16_t py = y; py <= graphBottom; py += 2) {
+                for (int16_t py = graphBottom; py >= y; py -= 2) {
                     display.drawPixel(x, py, shade);
                 }
             }
