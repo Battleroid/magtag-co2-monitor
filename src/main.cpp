@@ -66,13 +66,18 @@ void setup() {
     if (wokeFromDeepSleep) {
         delay(200);
     } else {
-        delay(2000);
+        // On ESP32-S2 native USB CDC, the host needs time to re-enumerate
+        // after reset.  Wait up to 3 s for the connection, but don't block
+        // forever if no serial monitor is attached.
+        unsigned long serialWaitStart = millis();
+        while (!Serial && millis() - serialWaitStart < 3000) {
+            delay(50);
+        }
     }
 
     if (buttonWakeGPIO != 0) {
         Serial.printf("Button wake: GPIO %d\n", buttonWakeGPIO);
     }
-    Serial.println("MagTag CO2 Monitor starting...");
 
     // Load visual defaults.
     if (!wokeFromDeepSleep) {
@@ -164,8 +169,9 @@ void setup() {
     rtcHasUsbPowerState = true;
 
     lastSampleMs = millis();
-    lastDisplayMs = millis();
-    Serial.printf("Power mode: %s\n", usbPowerPresent ? "USB" : "Battery");
+    if (usbPowerPresent) {
+        lastDisplayMs = millis();
+    }
 
     // Button polling tasks are only useful in USB mode where we stay awake.
     // In battery mode, buttons wake the device via ext1 interrupt instead.
@@ -200,6 +206,20 @@ void setup() {
         delay(5000);
     }
 
+    // Re-print startup banner here — by this point the serial monitor
+    // from "make upload monitor" has had time to connect (5 s+ after
+    // reset).  USB CDC silently drops output when no host is listening,
+    // so printing earlier is unreliable.
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("  MagTag CO2 Monitor");
+    Serial.printf( "  Build: %s (%s)\n", BUILD_VERSION_STR, BUILD_HASH_STR);
+    Serial.println("========================================");
+    Serial.printf("Power mode: %s | Wake: %s\n",
+                   usbPowerPresent ? "USB" : "Battery",
+                   wokeFromDeepSleep ? "deep-sleep" : "cold-boot");
+    Serial.flush();
+
     // ── I2C + SCD-30 sensor ──
     Wire.begin(SDA, SCL);
 
@@ -209,24 +229,108 @@ void setup() {
                      || batterySampleElapsedMs >= BATTERY_SAMPLE_INTERVAL_MS;
 
     if (needScd30) {
-        if (!sensorInit()) {
-            Serial.println("ERROR: SCD-30 not found – check wiring");
-            showStatus("Sensor not found!");
-            while (true) { delay(1000); }
+        if (!wokeFromDeepSleep) {
+            showStatus("Initializing sensor...");
         }
-        scd30Ready = true;
-        Serial.println("SCD-30 initialised");
+        Serial.println("Initializing SCD-30...");
+        Serial.flush();
 
-        // After deep sleep the sensor was fully off; it needs ~25 s of
-        // continuous measurement before the readings are accurate.
-        // Poll buttons during warm-up so the UI stays responsive.
-        if (!usbPowerPresent && wokeFromDeepSleep) {
+        bool sensorOk = false;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            if (sensorInit()) {
+                sensorOk = true;
+                break;
+            }
+            Serial.printf("SCD-30 init attempt %d/3 failed\n", attempt);
+            Serial.flush();
+            delay(1000);
+        }
+
+        if (sensorOk) {
+            scd30Ready = true;
+            Serial.println("SCD-30 initialised");
+            Serial.flush();
+
+            if (!wokeFromDeepSleep) {
+                showStatus("Warming up sensor...");
+            }
+        } else {
+            scd30Ready = false;
+            Serial.println("WARNING: SCD-30 not found – continuing without sensor");
+            showStatus("Sensor not found!");
+            delay(3000);
+        }
+
+        // The SCD-30 needs continuous measurement time before the first
+        // valid reading.  On cold boot or deep-sleep wake, wait here so
+        // the UI doesn't sit on "Warming up sensor..." indefinitely.
+        if (sensorOk && !usbPowerPresent && wokeFromDeepSleep) {
             Serial.printf("SCD30 warm-up: %d ms (buttons active)\n", SCD30_WARMUP_MS);
             delayWithButtonPolling(SCD30_WARMUP_MS);
+        } else if (sensorOk && !wokeFromDeepSleep) {
+            // Fresh boot (USB or battery): poll until the first valid
+            // CO2 reading arrives, so the display can move past the
+            // "Warming up sensor..." status.
+            Serial.println("SCD30 warm-up: waiting for first valid reading...");
+            Serial.flush();
+            unsigned long warmStart = millis();
+            unsigned long lastProgressPrint = 0;
+            bool gotFirstReading = false;
+            while (millis() - warmStart < SCD30_WARMUP_MS) {
+                if (scd30.dataReady()) {
+                    if (scd30.read() && scd30.CO2 > 0.0f) {
+                        float co2 = scd30.CO2;
+                        float tempF = scd30.temperature * 9.0f / 5.0f + 32.0f;
+                        float rh = scd30.relative_humidity;
+                        Serial.printf("First reading: CO2 %.0f ppm | Temp %.1f F | RH %.1f %%\n",
+                                       co2, tempF, rh);
+                        Serial.flush();
+                        pushSample(co2, tempF, rh);
+                        lastCO2 = co2; lastTempF = tempF; lastRH = rh;
+                        hasReading = true;
+                        gotFirstReading = true;
+                        break;
+                    }
+                    Serial.println("SCD30 warm-up: data ready but CO2 = 0, retrying...");
+                }
+                unsigned long elapsedSec = (millis() - warmStart) / 1000;
+                if (elapsedSec >= lastProgressPrint + 5) {
+                    Serial.printf("SCD30 warm-up: %lu s elapsed\n", elapsedSec);
+                    Serial.flush();
+                    lastProgressPrint = elapsedSec;
+                }
+                delay(500);
+            }
+            if (!gotFirstReading) {
+                Serial.println("SCD30 warm-up timed out without valid reading");
+            }
+            // Clear the "Warming up sensor..." status so the display
+            // can show readings (or at least isn't stuck on the status).
+            if (gotFirstReading) {
+                showStatus("Sensor ready!");
+                delay(1000);
+                updateDisplay(lastCO2, lastTempF, lastRH);
+                lastDisplayMs = millis();
+            } else {
+                showStatus("Sensor warming up...");
+            }
         }
     } else {
         Serial.println("SCD30 skipped (poll-only wake)");
     }
+
+    // Force the first sample to fire immediately when loop() starts,
+    // rather than waiting a full sample interval from the middle of setup().
+    lastSampleMs = 0;
+
+    Serial.println("========================================");
+    Serial.printf("  Setup complete — entering loop()\n");
+    Serial.printf("  usbPowerPresent=%d  usbMounted=%d  usbByHeuristic=%d  score=%d\n",
+                   (int)usbPowerPresent, (int)usbMounted, (int)usbByHeuristic, usbHeuristicScore);
+    Serial.printf("  scd30Ready=%d  hasReading=%d  deepSleepEnabled=%d\n",
+                   (int)scd30Ready, (int)hasReading, (int)deepSleepEnabled);
+    Serial.println("========================================");
+    Serial.flush();
 }
 
 // ---------------------------------------------------------------------------
@@ -235,12 +339,28 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
+    // ── Visual heartbeat (independent of serial) ──
+    // Brief dim single-pixel flash every 5 s so you can confirm the loop
+    // is alive even when serial is not connected.
+    static unsigned long lastLoopLedMs = 0;
+    if (now - lastLoopLedMs >= 5000) {
+        lastLoopLedMs = now;
+        pixels.setPixelColor(0, pixels.Color(0, 5, 0));  // dim green
+        pixels.show();
+        delay(30);
+        pixels.setPixelColor(0, 0);
+        pixels.show();
+    }
+
     bool usbNow = detectUsbPowerPresent();
     if (usbNow != usbPowerPresent) {
         usbPowerPresent = usbNow;
         float battVNow = readBatteryVoltage();
         uint8_t battPctNow = batteryPercentFromVoltage(battVNow);
-        Serial.printf("Power mode changed: %s\n", usbPowerPresent ? "USB" : "Battery");
+        Serial.printf("Power mode changed: %s (mounted=%d heuristic=%d)\n",
+                       usbPowerPresent ? "USB" : "Battery",
+                       (int)usbMounted, (int)usbByHeuristic);
+        Serial.flush();
         if (usbPowerPresent) {
             resetBatteryTierNotificationsForUsb();
             flashNeopixelsColor(USB_CONNECTED_FLASH_R, USB_CONNECTED_FLASH_G, USB_CONNECTED_FLASH_B, 180);
@@ -280,6 +400,21 @@ void loop() {
     }
 
     if (!usbPowerPresent) {
+        // Entering battery path — flash red so user can visually confirm
+        static bool batteryPathAnnounced = false;
+        if (!batteryPathAnnounced) {
+            batteryPathAnnounced = true;
+            Serial.printf(">>> BATTERY PATH (mounted=%d heuristic=%d score=%d)\n",
+                           (int)usbMounted, (int)usbByHeuristic, usbHeuristicScore);
+            Serial.flush();
+            // Red flash = battery mode (visible even without serial)
+            pixels.setPixelColor(0, pixels.Color(30, 0, 0));
+            pixels.setPixelColor(3, pixels.Color(30, 0, 0));
+            pixels.show();
+            delay(200);
+            pixels.clear();
+            pixels.show();
+        }
         float battV = readBatteryVoltage();
         uint8_t battPct = batteryPercentFromVoltage(battV);
         handleBatteryTierTransition(battPct);
@@ -537,57 +672,106 @@ void loop() {
     // =====================================================================
     // USB ALWAYS-ON PATH — full display with graphs, FreeRTOS button tasks
     // =====================================================================
+    static bool usbPathAnnounced = false;
+    if (!usbPathAnnounced) {
+        usbPathAnnounced = true;
+        Serial.printf(">>> USB PATH (mounted=%d heuristic=%d score=%d)\n",
+                       (int)usbMounted, (int)usbByHeuristic, usbHeuristicScore);
+        Serial.flush();
+        // Blue flash = USB mode (visible without serial)
+        pixels.setPixelColor(0, pixels.Color(0, 0, 30));
+        pixels.setPixelColor(3, pixels.Color(0, 0, 30));
+        pixels.show();
+        delay(200);
+        pixels.clear();
+        pixels.show();
+    }
+
+    // Periodic heartbeat so the serial monitor shows signs of life even
+    // between sample intervals (every ~10 s).
+    static unsigned long lastHeartbeatMs = 0;
+    if (now - lastHeartbeatMs >= 10000) {
+        lastHeartbeatMs = now;
+        float hbBattV = readBatteryVoltage();
+        uint8_t hbBattPct = batteryPercentFromVoltage(hbBattV);
+        Serial.printf("[heartbeat] uptime=%lus | scd30=%s | readings=%s | batt=%.2fV (%u%%) | usb=%d\n",
+                       now / 1000,
+                       scd30Ready ? "ok" : "NOT READY",
+                       hasReading ? "yes" : "no",
+                       hbBattV, hbBattPct,
+                       (int)usbPowerPresent);
+        Serial.flush();
+    }
+
     uint32_t sampleIntervalMs = currentSampleIntervalMs();
     uint32_t displayIntervalMs = currentDisplayIntervalMs();
     bool shouldSample = (now - lastSampleMs >= sampleIntervalMs);
 
     if (shouldSample) {
         lastSampleMs = now;
+        Serial.printf("[sample] Sampling sensor (interval=%u ms)...\n", sampleIntervalMs);
 
-        // Wait for sensor data (up to 5 s)
-        sensorWaitForData(5000);
-
-        float co2, tempF, rh;
-        if (sensorRead(&co2, &tempF, &rh)) {
-            if (co2 <= 0.0f) {
-                Serial.println("Ignoring invalid CO2 reading (0 ppm)");
+        if (!scd30Ready) {
+            // Periodically retry sensor init
+            Serial.println("SCD-30 not ready – attempting re-init...");
+            Wire.begin(SDA, SCL);
+            if (sensorInit()) {
+                scd30Ready = true;
+                Serial.println("SCD-30 re-init succeeded");
+                showStatus("Sensor connected!");
+                delay(1000);
             } else {
-                {
-                    float uBattV = readBatteryVoltage();
-                    uint8_t uBattPct = batteryPercentFromVoltage(uBattV);
-                    handleBatteryTierTransition(uBattPct);
-                    Serial.printf("CO2: %.0f ppm | Temp: %.1f F | RH: %.1f %% | Batt: %.2fV (%u%%)\n",
-                                   co2, tempF, rh, uBattV, uBattPct);
-                }
-
-                portENTER_CRITICAL(&stateMux);
-                displayUpdateInProgress = true;
-                portEXIT_CRITICAL(&stateMux);
-
-                pushSample(co2, tempF, rh);
-                bool firstDisplay = !hasReading;
-                lastCO2 = co2; lastTempF = tempF; lastRH = rh;
-                hasReading = true;
-                flashSampleIndicator();
-
-                bool shouldDisplay = firstDisplay || (millis() - lastDisplayMs >= displayIntervalMs);
-                if (shouldDisplay) {
-                    updateDisplay(co2, tempF, rh);
-                    lastDisplayMs = millis();
-                    if (carouselModeEnabled) {
-                        advanceDisplayMode();
-                    }
-                }
-
-                portENTER_CRITICAL(&stateMux);
-                displayUpdateInProgress = false;
-                portEXIT_CRITICAL(&stateMux);
-
-                applyPendingModeCycleIfAny();
-                applyPendingCarouselToggleIfAny();
+                Serial.println("SCD-30 re-init failed");
             }
-        } else {
-            Serial.println("Failed to read SCD-30");
+        }
+
+        if (scd30Ready) {
+            // Wait for sensor data (up to 5 s)
+            Serial.println("[sample] Waiting for SCD-30 data...");
+            sensorWaitForData(5000);
+
+            float co2, tempF, rh;
+            if (sensorRead(&co2, &tempF, &rh)) {
+                if (co2 <= 0.0f) {
+                    Serial.println("[sample] Ignoring invalid CO2 reading (0 ppm)");
+                } else {
+                    {
+                        float uBattV = readBatteryVoltage();
+                        uint8_t uBattPct = batteryPercentFromVoltage(uBattV);
+                        handleBatteryTierTransition(uBattPct);
+                        Serial.printf("CO2: %.0f ppm | Temp: %.1f F | RH: %.1f %% | Batt: %.2fV (%u%%)\n",
+                                       co2, tempF, rh, uBattV, uBattPct);
+                    }
+
+                    portENTER_CRITICAL(&stateMux);
+                    displayUpdateInProgress = true;
+                    portEXIT_CRITICAL(&stateMux);
+
+                    pushSample(co2, tempF, rh);
+                    bool firstDisplay = !hasReading;
+                    lastCO2 = co2; lastTempF = tempF; lastRH = rh;
+                    hasReading = true;
+                    flashSampleIndicator();
+
+                    bool shouldDisplay = firstDisplay || (millis() - lastDisplayMs >= displayIntervalMs);
+                    if (shouldDisplay) {
+                        updateDisplay(co2, tempF, rh);
+                        lastDisplayMs = millis();
+                        if (carouselModeEnabled) {
+                            advanceDisplayMode();
+                        }
+                    }
+
+                    portENTER_CRITICAL(&stateMux);
+                    displayUpdateInProgress = false;
+                    portEXIT_CRITICAL(&stateMux);
+
+                    applyPendingModeCycleIfAny();
+                    applyPendingCarouselToggleIfAny();
+                }
+            } else {
+                Serial.println("Failed to read SCD-30");
+            }
         }
     }
 

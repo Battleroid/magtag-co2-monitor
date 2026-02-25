@@ -141,6 +141,8 @@ void handleModeCycleRequest() {
 
     if (hasReading) {
         updateDisplay(lastCO2, lastTempF, lastRH);
+    } else {
+        showStatus("Waiting for data...");
     }
 
     portENTER_CRITICAL(&stateMux);
@@ -167,6 +169,8 @@ void applyPendingModeCycleIfAny() {
 
     if (hasReading) {
         updateDisplay(lastCO2, lastTempF, lastRH);
+    } else {
+        showStatus("Waiting for data...");
     }
 
     portENTER_CRITICAL(&stateMux);
@@ -198,6 +202,8 @@ void handleCarouselToggleRequest() {
 
     if (hasReading) {
         updateDisplay(lastCO2, lastTempF, lastRH);
+    } else {
+        showStatus("Waiting for data...");
     }
 
     portENTER_CRITICAL(&stateMux);
@@ -228,6 +234,8 @@ void applyPendingCarouselToggleIfAny() {
 
     if (hasReading) {
         updateDisplay(lastCO2, lastTempF, lastRH);
+    } else {
+        showStatus("Waiting for data...");
     }
 
     portENTER_CRITICAL(&stateMux);

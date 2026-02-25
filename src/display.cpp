@@ -159,6 +159,30 @@ static void drawGraph(const float *buf, int n,
             }
         }
     }
+
+    // Extend the last sample to the right edge so the graph doesn't show
+    // a gap when millis() has advanced past the most recent sample
+    // (e.g. after viewing the stats screen or between sleep cycles).
+    int lastIdx = start + win - 1;
+    unsigned long lastAge = nowMs - histGetTs(lastIdx);
+    if (lastAge > 0) {
+        int16_t lastX = gx + gw - 1 - (int32_t)lastAge * (gw - 1) / (int32_t)windowMs;
+        int16_t rightEdge = gx + gw - 1;
+        if (lastX < rightEdge - 1) {
+            int16_t lastY = yForVal(histGet(buf, lastIdx));
+#if GRAPH_FILL_MODE != 0
+            fillUnderSegment(lastX, lastY, rightEdge, lastY);
+#endif
+            if (GRAPH_LINE_THICKNESS <= 1) {
+                display.drawLine(lastX, lastY, rightEdge, lastY, fg);
+            } else {
+                int16_t half = GRAPH_LINE_THICKNESS / 2;
+                for (int16_t off = -half; off <= half; ++off) {
+                    display.drawLine(lastX, lastY + off, rightEdge, lastY + off, fg);
+                }
+            }
+        }
+    }
 }
 
 static bool getWindowMinMax(const float *buf, int n, float *outLo, float *outHi) {
