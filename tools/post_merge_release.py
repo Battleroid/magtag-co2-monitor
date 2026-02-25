@@ -88,6 +88,8 @@ def get_commits_for_release(previous_build: int, current_build: int) -> list[tup
             continue
         if subject.startswith("chore(release):") and "[skip ci]" in subject:
             continue
+        if re.match(r"^Merge (pull request|branch) ", subject):
+            continue
         commits.append((sha, subject))
 
     if commits:
@@ -176,9 +178,18 @@ def upsert_release_section(
         commit_base_url=commit_base_url,
     )
 
-    insert_at = len(lines)
-    if insert_at > 0 and lines[insert_at - 1] != "":
-        lines.append("")
+    # Insert after the "# Changelog" header so newest releases appear first.
+    insert_at = 0
+    for i, line in enumerate(lines):
+        if line.startswith("# "):
+            insert_at = i + 1
+            break
+    # Skip any blank lines immediately after the header
+    while insert_at < len(lines) and lines[insert_at].strip() == "":
+        insert_at += 1
+    # Ensure a blank line separates the header from the new section
+    if insert_at > 0 and lines[insert_at - 1].strip() != "":
+        lines.insert(insert_at, "")
         insert_at += 1
     lines[insert_at:insert_at] = release_lines
 
