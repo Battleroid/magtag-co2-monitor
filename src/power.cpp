@@ -8,6 +8,10 @@
 #include <esp_bt.h>
 #endif
 
+#if CONFIG_TINYUSB_ENABLED
+#include <USB.h>
+#endif
+
 #include "config.h"
 #include "state.h"
 #include "power.h"
@@ -47,8 +51,21 @@ static void adjustUsbHeuristicScore(float dv) {
 }
 
 bool detectUsbPowerPresent() {
-    // Primary: event-driven mount state (instant on plug/unplug)
+    // Primary: poll TinyUSB mount state directly.  Event callbacks
+    // (STARTED/STOPPED) require the CPU to be running, so they miss
+    // state changes during light sleep.  Polling (bool)USB reads the
+    // internal tinyusb_device_mounted flag which TinyUSB updates when
+    // its task processes USB bus state after wake.
+#if CONFIG_TINYUSB_ENABLED
+    bool mounted = (bool)USB;
+    if (mounted != usbMounted) {
+        Serial.printf("USB mount sync: event=%d polled=%d\n",
+                       (int)usbMounted, (int)mounted);
+        usbMounted = mounted;
+    }
+#else
     bool mounted = usbMounted;
+#endif
     static bool prevMounted = false;
 
     // Secondary: voltage heuristic for dumb chargers that don't enumerate
@@ -226,6 +243,14 @@ void enterLightSleepMs(uint32_t sleepMs) {
     // Release display from hardware reset so the EPD library can talk to
     // it on the next updateDisplay() call (powerUp() handles the rest).
     digitalWrite(EPD_RESET, HIGH);
+
+    // Brief yield after light sleep lets the TinyUSB task process pending
+    // USB re-enumeration.  During sleep the USB PHY clock stops and D+/D-
+    // go idle; on wake the device re-asserts D+ and the host enumerates
+    // within ~100-300 ms.  Without this window, detectUsbPowerPresent()
+    // runs before tud_mount_cb fires and a reconnected USB cable is
+    // never detected.
+    delay(250);
 
     // SCD30 is managed by the caller — it may or may not be running
     // depending on the warmup schedule.  I2C bus is restored above.

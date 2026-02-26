@@ -709,9 +709,12 @@ void showStatsScreen() {
     formatDuration(BATTERY_DISPLAY_INTERVAL_MS, batDisplay, sizeof(batDisplay));
     snprintf(graphWin, sizeof(graphWin), "%dm", GRAPH_WINDOW_MINUTES);
 
-    const char *sleepMode = usbPowerPresent ? "USB"
-                          : deepSleepEnabled ? "Deep"
-                          : "Light";
+    const char *powerStatus;
+    if (usbPowerPresent) {
+        powerStatus = battV < 3.0f ? "USB (no batt?)" : "USB";
+    } else {
+        powerStatus = deepSleepEnabled ? "Batt (deep sleep)" : "Batt (light sleep)";
+    }
 
     display.clearBuffer();
     display.fillScreen(bgColor());
@@ -744,7 +747,7 @@ void showStatsScreen() {
     y += 12;
 
     display.setCursor(x, y);
-    display.printf("Mode: %s", sleepMode);
+    display.printf("Power: %s", powerStatus);
     y += 18;
 
     // ── Left column: configuration ──
