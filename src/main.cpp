@@ -285,11 +285,9 @@ void setup() {
             unsigned long lastProgressPrint = 0;
             bool gotFirstReading = false;
             while (millis() - warmStart < SCD30_WARMUP_MS) {
-                if (scd30.dataReady()) {
-                    if (scd30.read() && scd30.CO2 > 0.0f) {
-                        float co2 = scd30.CO2;
-                        float tempF = scd30.temperature * 9.0f / 5.0f + 32.0f;
-                        float rh = scd30.relative_humidity;
+                if (sensorReady()) {
+                    float co2, tempF, rh;
+                    if (sensorRead(&co2, &tempF, &rh) && co2 > 0.0f) {
                         Serial.printf("First reading: CO2 %.0f ppm | Temp %.1f F | RH %.1f %%\n",
                                        co2, tempF, rh);
                         Serial.flush();
