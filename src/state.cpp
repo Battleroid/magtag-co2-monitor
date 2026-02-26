@@ -98,6 +98,7 @@ RTC_DATA_ATTR float    rtcLastRH             = 0;
 RTC_DATA_ATTR bool     rtcHasReading         = false;
 RTC_DATA_ATTR bool     rtcDeepSleepEnabled   = false;
 RTC_DATA_ATTR uint8_t  rtcDeepDisplayMode    = DEEP_DISPLAY_MODE_COMBINED;
+RTC_DATA_ATTR bool     rtcScd30WarmingUp      = false;
 
 bool     wokeFromDeepSleep = false;
 uint8_t  buttonWakeGPIO = 0;

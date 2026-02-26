@@ -96,6 +96,7 @@ extern RTC_DATA_ATTR float    rtcLastRH;
 extern RTC_DATA_ATTR bool     rtcHasReading;
 extern RTC_DATA_ATTR bool     rtcDeepSleepEnabled;
 extern RTC_DATA_ATTR uint8_t  rtcDeepDisplayMode;
+extern RTC_DATA_ATTR bool     rtcScd30WarmingUp;
 
 extern bool     wokeFromDeepSleep;
 extern uint8_t  buttonWakeGPIO;

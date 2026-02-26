@@ -15,8 +15,12 @@
 #include "leds.h"
 
 float readBatteryVoltage() {
-    int raw = analogRead(BATT_MONITOR);
-    return (raw / 4095.0f) * 3.3f * 2.0f;
+    // Use factory-calibrated millivolt reading instead of raw ADC conversion.
+    // The MagTag has a 2:1 resistor divider on the battery pin, so multiply
+    // the measured voltage by 2.  analogReadMilliVolts() accounts for the
+    // actual ADC reference and per-chip eFuse calibration, giving ~50 mV
+    // better accuracy than the naive (raw / 4095) * 3.3 formula.
+    return analogReadMilliVolts(BATT_MONITOR) * 2.0f / 1000.0f;
 }
 
 uint8_t batteryPercentFromVoltage(float voltage) {
@@ -117,8 +121,10 @@ void enterDeepSleepMs(uint32_t sleepMs) {
     rtcDeepSleepEnabled = deepSleepEnabled;
     rtcDeepDisplayMode  = currentDeepDisplayMode;
 
-    // Stop SCD30 continuous measurement (only if we started it)
-    if (scd30Ready) {
+    // Stop SCD30 — but leave it running if it's in the pre-sample
+    // warmup phase (rtcScd30WarmingUp).  The sensor continues on its
+    // own clock during deep sleep and will be ready at sample time.
+    if (scd30Ready && !rtcScd30WarmingUp) {
         bool stopOk = sensorStop();
         if (!stopOk) {
             Serial.println("Warning: failed to send SCD30 stop command");
@@ -167,14 +173,12 @@ void enterDeepSleepMs(uint32_t sleepMs) {
 }
 
 void enterLightSleepMs(uint32_t sleepMs) {
-    // ── Power down peripherals (mirror deep-sleep path for consistency) ──
-
-    // Stop SCD30 continuous measurement to save ~19 mA during sleep.
-    if (scd30Ready) {
-        if (!sensorStop()) {
-            Serial.println("Warning: failed to send SCD30 stop command (light sleep)");
-        }
-    }
+    // ── Power down peripherals ──
+    // NOTE: The SCD30 is managed by the caller.  During the warmup
+    // phase (started SCD30_WARMUP_MS before sample time) it remains
+    // powered and continues continuous measurement on its own clock
+    // while the ESP32 sleeps.  Between samples the sensor is stopped
+    // to save ~19 mA.
 
     // E-ink display: software power-down + hold RESET low
     display.powerDown();
@@ -219,15 +223,12 @@ void enterLightSleepMs(uint32_t sleepMs) {
     SPI.begin();
     Wire.begin(SDA, SCL);
 
-    // Restart SCD30 continuous measurement (was stopped before sleep).
-    // The sensor optics are still warm from the brief idle, so no extended
-    // warm-up is needed — the next measurement interval (~2 s) is sufficient.
-    if (scd30Ready) {
-        if (!sensorInit()) {
-            Serial.println("Warning: SCD30 re-init failed after light sleep");
-            scd30Ready = false;
-        }
-    }
+    // Release display from hardware reset so the EPD library can talk to
+    // it on the next updateDisplay() call (powerUp() handles the rest).
+    digitalWrite(EPD_RESET, HIGH);
+
+    // SCD30 is managed by the caller — it may or may not be running
+    // depending on the warmup schedule.  I2C bus is restored above.
 
     lightSleepWakePending = true;
     Serial.printf("Woke from light sleep, cause: %d\n", (int)esp_sleep_get_wakeup_cause());

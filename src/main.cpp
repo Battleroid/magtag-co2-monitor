@@ -228,7 +228,15 @@ void setup() {
     bool needScd30 = usbPowerPresent || !wokeFromDeepSleep || !deepSleepEnabled
                      || batterySampleElapsedMs >= BATTERY_SAMPLE_INTERVAL_MS;
 
-    if (needScd30) {
+    if (rtcScd30WarmingUp && wokeFromDeepSleep) {
+        // SCD30 was started in a previous deep-sleep cycle for warmup.
+        // It has been running during sleep on its own clock — skip
+        // sensorInit() which would restart continuous measurement and
+        // reset the warmup timer.
+        scd30Ready = true;
+        Serial.println("SCD30 continuing warmup from prior cycle");
+        Serial.flush();
+    } else if (needScd30) {
         if (!wokeFromDeepSleep) {
             showStatus("Initializing sensor...");
         }
@@ -366,6 +374,11 @@ void loop() {
             flashNeopixelsColor(USB_CONNECTED_FLASH_R, USB_CONNECTED_FLASH_G, USB_CONNECTED_FLASH_B, 180);
             playUsbConnectedJingle();
 
+            // Force an immediate sample + display update now that we're
+            // back on USB power with faster cadence.
+            lastSampleMs = 0;
+            lastDisplayMs = 0;
+
             // Recreate button tasks for USB mode (if not already running)
             if (modeButtonTaskHandle == nullptr)
                 xTaskCreate(modeButtonTask, "mode_btn", 8192, nullptr, 1, &modeButtonTaskHandle);
@@ -396,6 +409,10 @@ void loop() {
             handleBatteryTierTransition(battPctNow);
             flashBatteryLedTier(batteryLedTierFromPercent(battPctNow), 1, BATTERY_LEVEL_FLASH_ON_MS, BATTERY_LEVEL_FLASH_OFF_MS);
             playUsbDisconnectedJingle();
+
+            // Force display update on the first battery sample rather
+            // than waiting up to BATTERY_DISPLAY_INTERVAL_MS (5 min).
+            lastDisplayMs = 0;
         }
     }
 
@@ -463,8 +480,26 @@ void loop() {
                 showBatteryWarningMessage("Battery at 50%", "", BATTERY_WARN_50_DURATION_MS, false);
             }
 
-            // ── Sample timing (poll-only wakes don't read sensor) ──
+            // ── SCD30 warmup scheduling ──
+            // Start the SCD30 one warmup period + one poll cycle before
+            // sample time so it's producing valid data when we read it.
+            const uint32_t warmupStartAt = (BATTERY_SAMPLE_INTERVAL_MS > SCD30_WARMUP_MS + BATTERY_USB_POLL_INTERVAL_MS)
+                                           ? (BATTERY_SAMPLE_INTERVAL_MS - SCD30_WARMUP_MS - BATTERY_USB_POLL_INTERVAL_MS)
+                                           : 0;
+
             if (batterySampleElapsedMs < BATTERY_SAMPLE_INTERVAL_MS) {
+                // Not sample time yet — check if warmup should start
+                if (!scd30Ready && batterySampleElapsedMs >= warmupStartAt) {
+                    Wire.begin(SDA, SCL);
+                    if (sensorInit()) {
+                        scd30Ready = true;
+                        rtcScd30WarmingUp = true;
+                        Serial.printf("SCD30 started for warmup (elapsed %lu ms)\n",
+                                       (unsigned long)batterySampleElapsedMs);
+                    } else {
+                        Serial.println("SCD30 warmup start failed");
+                    }
+                }
                 batterySampleElapsedMs += sleepPollMs;
                 if (batterySampleElapsedMs > BATTERY_SAMPLE_INTERVAL_MS)
                     batterySampleElapsedMs = BATTERY_SAMPLE_INTERVAL_MS;
@@ -472,11 +507,20 @@ void loop() {
                 return;
             }
             batterySampleElapsedMs = 0;
+            rtcScd30WarmingUp = false;
 
             if (!scd30Ready) {
-                Serial.println("SCD30 not ready at sample time – sleeping");
-                enterDeepSleepMs(sleepPollMs);
-                return;
+                Serial.println("SCD30 not ready at sample time – re-init + warmup");
+                Wire.begin(SDA, SCL);
+                if (sensorInit()) {
+                    scd30Ready = true;
+                    Serial.println("SCD30 emergency re-init, blocking warmup");
+                    delayWithButtonPolling(SCD30_WARMUP_MS);
+                } else {
+                    Serial.println("SCD30 re-init failed, skipping sample");
+                    enterDeepSleepMs(sleepPollMs);
+                    return;
+                }
             }
 
             // Wait for sensor data, poll buttons
@@ -630,6 +674,20 @@ void loop() {
             if (now - lastSampleMs >= BATTERY_SAMPLE_INTERVAL_MS) {
                 lastSampleMs = now;
 
+                // Recovery fallback — if the warmup scheduling failed
+                // (e.g. I2C glitch), emergency re-init + blocking warmup.
+                if (!scd30Ready) {
+                    Serial.println("SCD-30 not ready at sample time – emergency re-init + warmup");
+                    Wire.begin(SDA, SCL);
+                    if (sensorInit()) {
+                        scd30Ready = true;
+                        Serial.println("SCD-30 emergency re-init, blocking warmup");
+                        sensorWaitForData(SCD30_WARMUP_MS);
+                    } else {
+                        Serial.println("SCD-30 re-init failed (battery)");
+                    }
+                }
+
                 if (scd30Ready) {
                     sensorWaitForData(5000);
 
@@ -653,6 +711,12 @@ void loop() {
                     } else {
                         Serial.println("Failed to read SCD-30");
                     }
+
+                    // Stop the SCD30 after sampling to save ~19 mA during
+                    // the ~50 s of idle sleep until the next sample.
+                    sensorStop();
+                    scd30Ready = false;
+                    Serial.println("SCD30 stopped after sample");
                 }
             }
 
@@ -663,6 +727,21 @@ void loop() {
             uint32_t sleepFor = remaining;
             if (sleepFor > BATTERY_USB_POLL_INTERVAL_MS) sleepFor = BATTERY_USB_POLL_INTERVAL_MS;
             if (sleepFor < 1000) sleepFor = 1000;
+
+            // Start the SCD30 one warmup period + one poll cycle before
+            // the next sample is due.  The extra poll cycle accounts for
+            // the discrete 10 s checking granularity and guarantees at
+            // least SCD30_WARMUP_MS of actual sensor runtime.
+            if (!scd30Ready && remaining <= SCD30_WARMUP_MS + BATTERY_USB_POLL_INTERVAL_MS) {
+                Wire.begin(SDA, SCL);
+                if (sensorInit()) {
+                    scd30Ready = true;
+                    Serial.printf("SCD30 started for warmup (%lu ms before sample)\n",
+                                   (unsigned long)remaining);
+                } else {
+                    Serial.println("SCD30 warmup start failed (will retry)");
+                }
+            }
 
             enterLightSleepMs(sleepFor);
             return;
