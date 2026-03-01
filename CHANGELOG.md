@@ -1,5 +1,14 @@
 # Changelog
 
+## v41 - 2026-03-01
+
+- [191561b](https://github.com/Battleroid/magtag-co2-monitor/commit/191561b9100ed2de2a7fa2303a53dfd3b3ad3363) refactor everything into pieces
+- [ecfaad6](https://github.com/Battleroid/magtag-co2-monitor/commit/ecfaad6ec694707c34d96820dec5943c67629685) ideally fix release/changelog action
+- [9251afb](https://github.com/Battleroid/magtag-co2-monitor/commit/9251afbb834b5b20a9e094b360515d67f1e0a913) serial logging functional again, loop functional
+- [86776eb](https://github.com/Battleroid/magtag-co2-monitor/commit/86776eb35d9512771c029924afd69cdcd60387a1) fix loop on battery
+- [dab090c](https://github.com/Battleroid/magtag-co2-monitor/commit/dab090c59a645218ede434f244bc2a43a7a6a2ab) fix sleep mode loop (finally, i hope?)
+- [66c8cc4](https://github.com/Battleroid/magtag-co2-monitor/commit/66c8cc43b35e90235424fed4914b2deba8918a53) use sensorReady
+
 ## v23 - 2026-02-22
 
 - [04ad5fc](https://github.com/battleroid/magtag-co2-monitor/commit/04ad5fcc2ba18126bf5db477c15d8b8373ee136f) remove unused definitions
